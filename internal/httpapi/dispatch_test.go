@@ -56,10 +56,13 @@ func TestDispatchPassPersistsAndControls(t *testing.T) {
 	for _, e := range events {
 		seen[e.Type] = true
 	}
-	for _, typ := range []string{"dispatch.started", "routing.decided", "command.requested", "command.acknowledged", "task.delegated", "command.completed", "dispatch.completed"} {
+	for _, typ := range []string{"dispatch.started", "routing.decided", "command.requested", "command.acknowledged", "task.delegated"} {
 		if !seen[typ] {
 			t.Fatalf("missing %s", typ)
 		}
+	}
+	if seen["command.completed"] || seen["dispatch.completed"] {
+		t.Fatal("acknowledgement was incorrectly treated as a result")
 	}
 	w = call(t, h, "POST", "/api/v1/runs/pass/controls/pause", `{"task_id":"task-1","idempotency_key":"pause-1","fencing_token":1}`)
 	if w.Code != 202 {
@@ -150,7 +153,7 @@ func TestSideEffectingTaskRequestsValidApprovalBeforeDispatch(t *testing.T) {
 		t.Fatalf("dag=%d %s", w.Code, w.Body.String())
 	}
 	w := call(t, h, "POST", "/api/v1/dispatch/run", `{"id":"side-run","catalog_id":"side","dag_id":"side-dag","adapter":"fixture"}`)
-	if w.Code != http.StatusAccepted {
+	if w.Code != http.StatusCreated {
 		t.Fatalf("run=%d %s", w.Code, w.Body.String())
 	}
 	var request core.Event
@@ -169,6 +172,15 @@ func TestSideEffectingTaskRequestsValidApprovalBeforeDispatch(t *testing.T) {
 	w = call(t, h, "POST", "/api/v1/runs/side-run/approvals/"+digest+"/grant", `{"actor":"local-owner"}`)
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("grant=%d %s", w.Code, w.Body.String())
+	}
+	before := len(s.Events("side-run", 0))
+	w = call(t, h, "POST", "/api/v1/runs/side-run/approvals/"+digest+"/grant", `{"actor":"local-owner"}`)
+	if w.Code != http.StatusOK || len(s.Events("side-run", 0)) != before {
+		t.Fatalf("duplicate grant not idempotent: %d %s", w.Code, w.Body.String())
+	}
+	w = call(t, h, "POST", "/api/v1/runs/side-run/tasks/publish/result", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("result=%d %s", w.Code, w.Body.String())
 	}
 	seenCommand, seenCompleted := false, false
 	for _, event := range s.Events("side-run", 0) {
@@ -198,6 +210,48 @@ func TestEmergencyStopIsRecoveredFailClosed(t *testing.T) {
 	w := call(t, h, "POST", "/api/v1/runs/stopped/controls/resume", `{"task_id":"task-1","idempotency_key":"resume-after-restart","fencing_token":1}`)
 	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "emergency stop") {
 		t.Fatalf("control=%d %s", w.Code, w.Body.String())
+	}
+}
+
+func TestApprovalContinuationCompletesRemainingDAG(t *testing.T) {
+	s, _ := core.OpenStore(filepath.Join(t.TempDir(), "d.db"))
+	defer s.Close()
+	h := New("dispatch", s)
+	cat := `{"id":"chain-cat","catalog":{"Version":"v1","Capabilities":[{"Name":"read","Version":"v1","SideEffecting":false},{"Name":"write","Version":"v1","SideEffecting":true}],"Agents":[{"ID":"worker","Version":"v1","Capabilities":["read@v1","write@v1"],"Priority":1,"Enabled":true,"MaxConcurrent":3}]}}`
+	if w := call(t, h, "POST", "/api/v1/agents", cat); w.Code != 201 {
+		t.Fatal(w.Body.String())
+	}
+	dag := `{"id":"chain-dag","dag":{"Version":"v1","Tasks":[{"ID":"first","Version":"v1","Requires":["read@v1"],"Cost":1},{"ID":"middle","Version":"v1","Requires":["write@v1"],"DependsOn":["first"],"Cost":1},{"ID":"last","Version":"v1","Requires":["read@v1"],"DependsOn":["middle"],"Cost":1}],"MaxFanout":2,"Budget":3}}`
+	if w := call(t, h, "POST", "/api/v1/tasks", dag); w.Code != 201 {
+		t.Fatal(w.Body.String())
+	}
+	if w := call(t, h, "POST", "/api/v1/dispatch/run", `{"id":"chain","catalog_id":"chain-cat","dag_id":"chain-dag"}`); w.Code != 201 {
+		t.Fatal(w.Body.String())
+	}
+	if w := call(t, h, "POST", "/api/v1/runs/chain/tasks/first/result", ""); w.Code != 200 {
+		t.Fatalf("first=%d %s", w.Code, w.Body.String())
+	}
+	var digest string
+	for _, e := range s.Events("chain", 0) {
+		if e.Type == "approval.requested" {
+			digest = stringValue(e.Data["action_digest"])
+		}
+	}
+	if digest == "" {
+		t.Fatal("middle approval not requested")
+	}
+	if w := call(t, h, "POST", "/api/v1/runs/chain/approvals/"+digest+"/grant", `{"actor":"local-owner"}`); w.Code != 202 {
+		t.Fatalf("grant=%d %s", w.Code, w.Body.String())
+	}
+	if w := call(t, h, "POST", "/api/v1/runs/chain/tasks/middle/result", ""); w.Code != 200 {
+		t.Fatalf("middle=%d %s", w.Code, w.Body.String())
+	}
+	if w := call(t, h, "POST", "/api/v1/runs/chain/tasks/last/result", ""); w.Code != 200 {
+		t.Fatalf("last=%d %s", w.Code, w.Body.String())
+	}
+	p, _ := s.Replay("chain", 0)
+	if p.Status != "completed" {
+		t.Fatalf("status=%s", p.Status)
 	}
 }
 

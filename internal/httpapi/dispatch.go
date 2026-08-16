@@ -81,6 +81,25 @@ func (s *Server) recoverControllers() {
 	}
 }
 
+func (s *Server) recoverAdapters() {
+	for _, run := range s.Store.ListRuns("dispatch") {
+		for _, event := range s.Store.Events(run.ID, 0) {
+			if event.Type != "dispatch.started" {
+				continue
+			}
+			switch stringValue(event.Data["adapter"]) {
+			case "openclaw":
+				if s.openclaw != nil {
+					s.adapters[run.ID] = s.openclaw
+				}
+			case "fixture", "":
+				s.adapters[run.ID] = adapters.NewFixture(adapters.FixtureMode(stringValue(event.Data["fixture_mode"])))
+			}
+			break
+		}
+	}
+}
+
 func stringValue(v any) string { s, _ := v.(string); return s }
 func uint64Number(v any) uint64 {
 	switch n := v.(type) {
@@ -234,83 +253,122 @@ func (s *Server) startDispatch(w http.ResponseWriter, r *http.Request) {
 	s.controllers[in.ID] = ctrl
 	s.adapters[in.ID] = adapter
 	s.mu.Unlock()
-	_, _ = s.Store.Append(in.ID, "dispatch.started", map[string]any{"catalog_id": in.CatalogID, "dag_id": in.DAGID, "catalog_version": catalog.Version, "dag_version": dag.Version, "adapter": defaultString(in.Adapter, "fixture")})
-	states := map[string]dispatch.AgentState{}
-	sideEffecting := map[string]bool{}
-	for _, capability := range catalog.Capabilities {
-		sideEffecting[capability.Name+"@"+capability.Version] = capability.SideEffecting
-	}
-	ordered, err := topological(dag.Tasks)
-	if err != nil {
+	_, _ = s.Store.Append(in.ID, "dispatch.started", map[string]any{"catalog_id": in.CatalogID, "dag_id": in.DAGID, "catalog_version": catalog.Version, "dag_version": dag.Version, "adapter": defaultString(in.Adapter, "fixture"), "fixture_mode": in.FixtureMode})
+	_ = timeout
+	if err := s.scheduleRun(in.ID, catalog, dag); err != nil {
 		_, _ = s.Store.Append(in.ID, "dispatch.failed", map[string]any{"error": err.Error()})
 		write(w, 422, map[string]string{"error": err.Error()})
 		return
 	}
-	hadFailure, hadUnknown := false, false
-	for _, task := range ordered {
-		decision, err := dispatch.Route(task, catalog.Agents, states, "capability/v1")
-		data := map[string]any{"task_id": task.ID, "decision": decision}
-		if err != nil {
-			data["error"] = err.Error()
-			_, _ = s.Store.Append(in.ID, "routing.failed", data)
-			_, _ = s.Store.Append(in.ID, "dispatch.failed", map[string]any{"error": "no eligible route"})
-			write(w, 422, map[string]any{"run_id": in.ID, "error": err.Error()})
-			return
-		}
-		_, _ = s.Store.Append(in.ID, "routing.decided", data)
-		requiresApproval := false
-		for _, capability := range task.Requires {
-			if sideEffecting[capability] {
-				requiresApproval = true
-				break
-			}
-		}
-		if requiresApproval {
-			action := dispatch.Action{Tool: strings.Join(task.Requires, ","), Target: task.ID, Arguments: map[string]string{"agent": decision.Selected}, InputVersions: map[string]string{"task": task.Version, "dag": dag.Version}, PolicyVersion: "capability/v1", Scope: "dispatch:" + task.ID}
-			digest := dispatch.ActionDigest(action)
-			expires := time.Now().UTC().Add(15 * time.Minute)
-			_, _ = s.Store.Append(in.ID, "approval.requested", map[string]any{"task_id": task.ID, "action": action, "action_digest": digest, "expires": expires.Format(time.RFC3339), "scope": action.Scope, "authorized_actors": []string{"local-owner"}})
-			_, _ = s.Store.Append(in.ID, "dispatch.interrupted", map[string]any{"outcome": "approval_required", "task_id": task.ID, "action_digest": digest})
-			write(w, http.StatusAccepted, map[string]any{"run_id": in.ID, "status": "approval_required", "action_digest": digest})
-			return
-		}
-		fence := ctrl.RenewLease(task.ID)
-		key := in.ID + ":" + task.ID + ":dispatch"
-		cmd, _ := ctrl.Request(dispatch.Command{ID: key, IdempotencyKey: key, TaskID: task.ID, Fence: fence}, time.Now())
-		_, _ = s.Store.Append(in.ID, "command.requested", commandData(cmd, "dispatch"))
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		ack, err := adapter.Dispatch(ctx, adapters.DispatchRequest{TaskID: task.ID, Agent: decision.Selected, IdempotencyKey: key, FencingToken: fence})
-		cancel()
-		if err != nil {
-			if adapters.IsOutcomeUnknown(err) {
-				hadUnknown = true
-				cmd, _ = ctrl.Transition(key, dispatch.CommandAcknowledged, "", "", time.Now())
-				cmd, _ = ctrl.Transition(key, dispatch.CommandOutcomeUnknown, "", err.Error(), time.Now())
-				_, _ = s.Store.Append(in.ID, "command.outcome_unknown", commandData(cmd, "dispatch"))
-				_, _ = s.Store.Append(in.ID, "task.outcome_unknown", map[string]any{"task_id": task.ID, "reconciliation_required": true, "retry_allowed": false})
-				continue
-			}
-			cmd, _ = ctrl.Transition(key, dispatch.CommandFailed, "", err.Error(), time.Now())
-			hadFailure = true
-			_, _ = s.Store.Append(in.ID, "command.failed", commandData(cmd, "dispatch"))
-			_, _ = s.Store.Append(in.ID, "task.failed", map[string]any{"task_id": task.ID, "error": err.Error()})
-			continue
-		}
-		cmd, _ = ctrl.Transition(key, dispatch.CommandAcknowledged, "", "", time.Now())
-		_, _ = s.Store.Append(in.ID, "command.acknowledged", commandData(cmd, "dispatch"))
-		_, _ = s.Store.Append(in.ID, "task.delegated", map[string]any{"task_id": task.ID, "agent_id": decision.Selected, "accepted": ack.Accepted, "fencing_token": fence})
-		cmd, _ = ctrl.Transition(key, dispatch.CommandCompleted, "accepted", "", time.Now())
-		_, _ = s.Store.Append(in.ID, "command.completed", commandData(cmd, "dispatch"))
-	}
-	if hadUnknown {
-		_, _ = s.Store.Append(in.ID, "dispatch.interrupted", map[string]any{"outcome": "outcome_unknown", "reconciliation_required": true})
-	} else if hadFailure {
-		_, _ = s.Store.Append(in.ID, "dispatch.failed", map[string]any{"outcome": "failed"})
-	} else {
-		_, _ = s.Store.Append(in.ID, "dispatch.completed", map[string]any{"outcome": "observed"})
-	}
 	run, _ := s.Store.GetRun(in.ID)
 	write(w, 201, run)
+}
+
+func (s *Server) scheduleRun(id string, catalog dispatch.Catalog, dag dispatch.TaskDAG) error {
+	ordered, err := topological(dag.Tasks)
+	if err != nil {
+		return err
+	}
+	events := s.Store.Events(id, 0)
+	completed, active := map[string]bool{}, map[string]bool{}
+	granted := map[string]bool{}
+	requested := map[string]bool{}
+	for _, e := range events {
+		task := stringValue(e.Data["task_id"])
+		if e.Type == "task.completed" {
+			completed[task] = true
+		}
+		if e.Type == "command.acknowledged" {
+			active[task] = true
+		}
+		if e.Type == "command.completed" || e.Type == "command.failed" || e.Type == "command.outcome_unknown" {
+			active[task] = false
+		}
+		if e.Type == "approval.requested" {
+			requested[stringValue(e.Data["action_digest"])] = true
+		}
+		if e.Type == "approval.granted" {
+			granted[stringValue(e.Data["action_digest"])] = true
+		}
+	}
+	side := map[string]bool{}
+	for _, c := range catalog.Capabilities {
+		side[c.Name+"@"+c.Version] = c.SideEffecting
+	}
+	for _, task := range ordered {
+		if completed[task.ID] || active[task.ID] {
+			continue
+		}
+		ready := true
+		for _, dep := range task.DependsOn {
+			if !completed[dep] {
+				ready = false
+			}
+		}
+		if !ready {
+			continue
+		}
+		decision, routeErr := dispatch.Route(task, catalog.Agents, map[string]dispatch.AgentState{}, "capability/v1")
+		if routeErr != nil {
+			return routeErr
+		}
+		_, _ = s.Store.Append(id, "routing.decided", map[string]any{"task_id": task.ID, "decision": decision})
+		requires := false
+		for _, capability := range task.Requires {
+			requires = requires || side[capability]
+		}
+		action := dispatch.Action{Tool: strings.Join(task.Requires, ","), Target: task.ID, Arguments: map[string]string{"agent": decision.Selected}, InputVersions: map[string]string{"task": task.Version, "dag": dag.Version}, PolicyVersion: "capability/v1", Scope: "dispatch:" + task.ID}
+		digest := dispatch.ActionDigest(action)
+		if requires && !granted[digest] {
+			if !requested[digest] {
+				_, _ = s.Store.Append(id, "approval.requested", map[string]any{"task_id": task.ID, "action": action, "action_digest": digest, "expires": time.Now().UTC().Add(15 * time.Minute).Format(time.RFC3339), "scope": action.Scope, "authorized_actors": []string{"local-owner"}})
+			}
+			return nil
+		}
+		if err := s.dispatchTask(id, task, decision.Selected); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Server) dispatchTask(id string, task dispatch.Task, agent string) error {
+	s.mu.Lock()
+	ctrl, adapter := s.controllers[id], s.adapters[id]
+	s.mu.Unlock()
+	if ctrl == nil || adapter == nil {
+		return errors.New("run execution context unavailable")
+	}
+	key := id + ":" + task.ID + ":dispatch"
+	if _, ok := ctrl.Command(key); ok {
+		return nil
+	}
+	fence := ctrl.RenewLease(task.ID)
+	cmd, err := ctrl.Request(dispatch.Command{ID: key, IdempotencyKey: key, TaskID: task.ID, Fence: fence}, time.Now())
+	if err != nil {
+		return err
+	}
+	_, _ = s.Store.Append(id, "command.requested", commandData(cmd, "dispatch"))
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ack, err := adapter.Dispatch(ctx, adapters.DispatchRequest{TaskID: task.ID, Agent: agent, IdempotencyKey: key, FencingToken: fence})
+	cancel()
+	if err != nil {
+		if adapters.IsOutcomeUnknown(err) {
+			cmd, _ = ctrl.Transition(key, dispatch.CommandAcknowledged, "", "", time.Now())
+			cmd, _ = ctrl.Transition(key, dispatch.CommandOutcomeUnknown, "", err.Error(), time.Now())
+			_, _ = s.Store.Append(id, "command.outcome_unknown", commandData(cmd, "dispatch"))
+			_, _ = s.Store.Append(id, "dispatch.interrupted", map[string]any{"outcome": "outcome_unknown", "reconciliation_required": true})
+			return nil
+		}
+		cmd, _ = ctrl.Transition(key, dispatch.CommandFailed, "", err.Error(), time.Now())
+		_, _ = s.Store.Append(id, "command.failed", commandData(cmd, "dispatch"))
+		_, _ = s.Store.Append(id, "dispatch.failed", map[string]any{"outcome": "failed"})
+		return nil
+	}
+	cmd, _ = ctrl.Transition(key, dispatch.CommandAcknowledged, "", "", time.Now())
+	_, _ = s.Store.Append(id, "command.acknowledged", commandData(cmd, "dispatch"))
+	_, _ = s.Store.Append(id, "task.delegated", map[string]any{"task_id": task.ID, "agent_id": agent, "accepted": ack.Accepted, "fencing_token": fence})
+	return nil
 }
 
 func topological(tasks []dispatch.Task) ([]dispatch.Task, error) {
@@ -519,6 +577,12 @@ func (s *Server) approve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	taskID := stringValue(requested.Data["task_id"])
+	for _, event := range events {
+		if event.Type == "approval.granted" && stringValue(event.Data["action_digest"]) == digest {
+			write(w, http.StatusOK, map[string]any{"accepted": true, "action_digest": digest, "decision": "grant", "idempotent": true})
+			return
+		}
+	}
 	if decision == "grant" && taskID != "" {
 		s.mu.Lock()
 		ctrl, adapter := s.controllers[id], s.adapters[id]
@@ -533,43 +597,95 @@ func (s *Server) approve(w http.ResponseWriter, r *http.Request) {
 		write(w, 500, map[string]string{"error": err.Error()})
 		return
 	}
-	if decision == "grant" && taskID != "" {
-		s.mu.Lock()
-		ctrl, adapter := s.controllers[id], s.adapters[id]
-		s.mu.Unlock()
-		fence := ctrl.RenewLease(taskID)
-		key := id + ":" + taskID + ":dispatch"
-		cmd, requestErr := ctrl.Request(dispatch.Command{ID: key, IdempotencyKey: key, TaskID: taskID, Fence: fence}, time.Now())
-		if requestErr != nil {
-			write(w, 409, map[string]string{"error": requestErr.Error()})
+	if decision == "deny" {
+		_, _ = s.Store.Append(id, "dispatch.failed", map[string]any{"outcome": "approval_denied", "task_id": taskID, "action_digest": digest})
+	} else if taskID != "" {
+		catalog, dag, ok := s.runDefinitions(id)
+		if !ok {
+			write(w, 409, map[string]string{"error": "run definitions unavailable"})
 			return
 		}
-		_, _ = s.Store.Append(id, "command.requested", commandData(cmd, "dispatch"))
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		ack, dispatchErr := adapter.Dispatch(ctx, adapters.DispatchRequest{TaskID: taskID, Agent: action.Arguments["agent"], IdempotencyKey: key, FencingToken: fence})
-		cancel()
-		if dispatchErr != nil {
-			if adapters.IsOutcomeUnknown(dispatchErr) {
-				cmd, _ = ctrl.Transition(key, dispatch.CommandAcknowledged, "", "", time.Now())
-				cmd, _ = ctrl.Transition(key, dispatch.CommandOutcomeUnknown, "", dispatchErr.Error(), time.Now())
-				_, _ = s.Store.Append(id, "command.outcome_unknown", commandData(cmd, "dispatch"))
-				_, _ = s.Store.Append(id, "dispatch.interrupted", map[string]any{"outcome": "outcome_unknown", "reconciliation_required": true})
-			} else {
-				cmd, _ = ctrl.Transition(key, dispatch.CommandFailed, "", dispatchErr.Error(), time.Now())
-				_, _ = s.Store.Append(id, "command.failed", commandData(cmd, "dispatch"))
-				_, _ = s.Store.Append(id, "dispatch.failed", map[string]any{"outcome": "failed"})
-			}
-			write(w, 202, map[string]any{"accepted": true, "action_digest": digest, "decision": decision, "command": cmd})
+		if err := s.scheduleRun(id, catalog, dag); err != nil {
+			_, _ = s.Store.Append(id, "dispatch.failed", map[string]any{"error": err.Error()})
+			write(w, 422, map[string]string{"error": err.Error()})
 			return
 		}
-		cmd, _ = ctrl.Transition(key, dispatch.CommandAcknowledged, "", "", time.Now())
-		_, _ = s.Store.Append(id, "command.acknowledged", commandData(cmd, "dispatch"))
-		_, _ = s.Store.Append(id, "task.delegated", map[string]any{"task_id": taskID, "agent_id": action.Arguments["agent"], "accepted": ack.Accepted, "fencing_token": fence})
-		cmd, _ = ctrl.Transition(key, dispatch.CommandCompleted, "accepted", "", time.Now())
-		_, _ = s.Store.Append(id, "command.completed", commandData(cmd, "dispatch"))
-		_, _ = s.Store.Append(id, "dispatch.completed", map[string]any{"outcome": "approved_and_observed"})
 	}
 	write(w, 202, map[string]any{"accepted": true, "action_digest": digest, "decision": decision})
+}
+
+func (s *Server) runDefinitions(id string) (dispatch.Catalog, dispatch.TaskDAG, bool) {
+	for _, event := range s.Store.Events(id, 0) {
+		if event.Type == "dispatch.started" {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			catalog, cok := s.catalogs[stringValue(event.Data["catalog_id"])]
+			dag, dok := s.dags[stringValue(event.Data["dag_id"])]
+			return catalog, dag, cok && dok
+		}
+	}
+	return dispatch.Catalog{}, dispatch.TaskDAG{}, false
+}
+
+func (s *Server) taskResult(w http.ResponseWriter, r *http.Request) {
+	id, taskID := r.PathValue("id"), r.PathValue("task")
+	if !s.owns(id) {
+		write(w, 404, map[string]string{"error": "run not found"})
+		return
+	}
+	s.mu.Lock()
+	ctrl, adapter := s.controllers[id], s.adapters[id]
+	s.mu.Unlock()
+	if ctrl == nil || adapter == nil {
+		write(w, 409, map[string]string{"error": "run execution context unavailable"})
+		return
+	}
+	key := id + ":" + taskID + ":dispatch"
+	cmd, ok := ctrl.Command(key)
+	if !ok || cmd.State != dispatch.CommandAcknowledged {
+		write(w, 409, map[string]string{"error": "task is not awaiting a result"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	result, err := adapter.Result(ctx, adapters.TaskRef{TaskID: taskID})
+	cancel()
+	if err != nil {
+		write(w, 502, map[string]string{"error": err.Error()})
+		return
+	}
+	if result.State != "completed" && result.State != "failed" && result.State != "cancelled" {
+		write(w, 202, result)
+		return
+	}
+	if result.State == "failed" {
+		cmd, _ = ctrl.Transition(key, dispatch.CommandFailed, "", result.State, time.Now())
+		_, _ = s.Store.Append(id, "command.failed", commandData(cmd, "dispatch"))
+		_, _ = s.Store.Append(id, "task.failed", map[string]any{"task_id": taskID, "result": result})
+		_, _ = s.Store.Append(id, "dispatch.failed", map[string]any{"outcome": "failed"})
+		write(w, 200, result)
+		return
+	}
+	cmd, _ = ctrl.Transition(key, dispatch.CommandCompleted, result.State, "", time.Now())
+	_, _ = s.Store.Append(id, "command.completed", commandData(cmd, "dispatch"))
+	_, _ = s.Store.Append(id, "task.completed", map[string]any{"task_id": taskID, "result": result})
+	catalog, dag, ok := s.runDefinitions(id)
+	if ok {
+		_ = s.scheduleRun(id, catalog, dag)
+	}
+	all := true
+	for _, task := range dag.Tasks {
+		found := false
+		for _, event := range s.Store.Events(id, 0) {
+			if event.Type == "task.completed" && stringValue(event.Data["task_id"]) == task.ID {
+				found = true
+			}
+		}
+		all = all && found
+	}
+	if all {
+		_, _ = s.Store.Append(id, "dispatch.completed", map[string]any{"outcome": "observed_results"})
+	}
+	write(w, 200, result)
 }
 
 func stringSlice(v any) []string {

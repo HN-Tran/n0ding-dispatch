@@ -59,6 +59,7 @@ func NewConfigured(mode string, store *core.Store, token, openclawEndpoint, open
 	s := &Server{Mode: mode, Store: store, Token: token, catalogs: map[string]dispatch.Catalog{}, dags: map[string]dispatch.TaskDAG{}, controllers: map[string]*dispatch.Controller{}, adapters: map[string]adapters.Adapter{}, openclaw: openclaw}
 	s.loadDefinitions()
 	s.recoverControllers()
+	s.recoverAdapters()
 	s.recoverInterrupted()
 	m := http.NewServeMux()
 	m.HandleFunc("GET /healthz", s.health)
@@ -80,6 +81,7 @@ func NewConfigured(mode string, store *core.Store, token, openclawEndpoint, open
 	m.HandleFunc("POST /api/v1/runs/{id}/controls/{action}", s.control)
 	m.HandleFunc("POST /api/v1/runs/{id}/approvals/{digest}/{decision}", s.approve)
 	m.HandleFunc("POST /api/v1/runs/{id}/reconcile", s.reconcile)
+	m.HandleFunc("POST /api/v1/runs/{id}/tasks/{task}/result", s.taskResult)
 	m.Handle("GET /", http.FileServer(http.FS(webassets.FS)))
 	return s.security(m), nil
 }

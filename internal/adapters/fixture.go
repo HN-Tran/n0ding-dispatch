@@ -74,6 +74,10 @@ func (f *Fixture) Result(ctx context.Context, r TaskRef) (Result, error) {
 	}
 	f.mu.Lock()
 	state := f.tasks[r.TaskID]
+	if state == "running" {
+		state = "completed"
+		f.tasks[r.TaskID] = state
+	}
 	f.mu.Unlock()
 	if state == "" {
 		state = "completed"
