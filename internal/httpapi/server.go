@@ -26,6 +26,7 @@ type Server struct {
 	dags        map[string]dispatch.TaskDAG
 	controllers map[string]*dispatch.Controller
 	adapters    map[string]adapters.Adapter
+	openclaw    adapters.Adapter
 	mutations   []time.Time
 }
 
@@ -37,7 +38,25 @@ func New(mode string, store *core.Store) http.Handler {
 }
 
 func NewAuthenticated(mode string, store *core.Store, token string) http.Handler {
-	s := &Server{Mode: mode, Store: store, Token: token, catalogs: map[string]dispatch.Catalog{}, dags: map[string]dispatch.TaskDAG{}, controllers: map[string]*dispatch.Controller{}, adapters: map[string]adapters.Adapter{}}
+	h, _ := NewConfigured(mode, store, token, "", "")
+	return h
+}
+
+// NewConfigured binds the OpenClaw credential to a server-owned endpoint.
+// Run requests can select this adapter but cannot choose where its secret goes.
+func NewConfigured(mode string, store *core.Store, token, openclawEndpoint, openclawToken string) (http.Handler, error) {
+	var openclaw adapters.Adapter
+	if openclawEndpoint != "" || openclawToken != "" {
+		if openclawEndpoint == "" || openclawToken == "" {
+			return nil, fmt.Errorf("OpenClaw endpoint and token must be configured together")
+		}
+		var err error
+		openclaw, err = adapters.NewOpenClawHTTP(openclawEndpoint, openclawToken, 15*time.Second)
+		if err != nil {
+			return nil, err
+		}
+	}
+	s := &Server{Mode: mode, Store: store, Token: token, catalogs: map[string]dispatch.Catalog{}, dags: map[string]dispatch.TaskDAG{}, controllers: map[string]*dispatch.Controller{}, adapters: map[string]adapters.Adapter{}, openclaw: openclaw}
 	s.loadDefinitions()
 	s.recoverControllers()
 	s.recoverInterrupted()
@@ -62,7 +81,7 @@ func NewAuthenticated(mode string, store *core.Store, token string) http.Handler
 	m.HandleFunc("POST /api/v1/runs/{id}/approvals/{digest}/{decision}", s.approve)
 	m.HandleFunc("POST /api/v1/runs/{id}/reconcile", s.reconcile)
 	m.Handle("GET /", http.FileServer(http.FS(webassets.FS)))
-	return s.security(m)
+	return s.security(m), nil
 }
 
 func (s *Server) exportRun(w http.ResponseWriter, r *http.Request) {

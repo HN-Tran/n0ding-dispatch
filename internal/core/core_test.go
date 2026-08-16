@@ -85,8 +85,8 @@ func TestFixturesDeterministicAndIndependent(t *testing.T) {
 			t.Fatalf("fixture not idempotent for %s", mode)
 		}
 		p, _ := s.Replay(r.ID, 0)
-		if p.Status != "completed" {
-			t.Fatalf("fixture incomplete: %#v", p)
+		if p.Status != "interrupted" {
+			t.Fatalf("fixture must honestly expose unresolved outcome: %#v", p)
 		}
 	}
 }

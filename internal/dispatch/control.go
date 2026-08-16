@@ -302,6 +302,15 @@ func (c *Controller) EmergencyStop(reason string) {
 		c.fences[k] = v + 1
 	}
 }
+
+// RestoreEmergencyStop reconstructs the fail-closed stop state from the
+// durable event log without generating new fencing tokens.
+func (c *Controller) RestoreEmergencyStop(reason string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.stopped = true
+	c.stopReason = reason
+}
 func (c *Controller) Stopped() (bool, string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

@@ -11,6 +11,18 @@ go build -o n0ding-dispatch ./cmd/n0ding-dispatch
 
 Open <http://127.0.0.1:8080>. Dispatch is independent and does not require n0ding Cache or n0ding Bench.
 
+To enable the OpenClaw adapter, bind its destination when starting the server and
+provide the credential only through the dedicated server-side environment variable:
+
+```bash
+N0DING_DISPATCH_OPENCLAW_TOKEN='...' \
+  ./n0ding-dispatch serve --db dispatch.db --openclaw-endpoint https://openclaw.example
+./n0ding-dispatch run --adapter openclaw --id RUN --catalog CATALOG --dag DAG
+```
+
+Run requests cannot override the configured endpoint or select arbitrary environment
+variables. The token is never included in a run definition or persisted event.
+
 CLI commands emit JSON and use stable exit codes (`0` success, `2` usage, `3` transport, `4` rejected):
 
 ```text
@@ -18,9 +30,10 @@ n0ding-dispatch init
 n0ding-dispatch serve
 n0ding-dispatch run --id RUN --catalog CATALOG --dag DAG
 n0ding-dispatch runs
-n0ding-dispatch control --run RUN [--task TASK] pause|resume|cancel|retry|reassign|emergency-stop
+n0ding-dispatch control --run RUN --task TASK --fencing-token TOKEN pause|resume|cancel|retry|reassign
+n0ding-dispatch control --run RUN emergency-stop
 n0ding-dispatch approve --run RUN --digest DIGEST --decision grant|deny
-n0ding-dispatch reconcile --run RUN --idempotency-key KEY --result RESULT
+n0ding-dispatch reconcile --run RUN --idempotency-key KEY --result RESULT --evidence EVIDENCE
 n0ding-dispatch export --run RUN
 n0ding-dispatch doctor
 ```

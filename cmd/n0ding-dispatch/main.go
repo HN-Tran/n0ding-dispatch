@@ -71,8 +71,6 @@ func run(args []string) int {
 		dag := fs.String("dag", "", "")
 		adapter := fs.String("adapter", "fixture", "")
 		mode := fs.String("fixture-mode", "pass", "")
-		endpoint := fs.String("openclaw-endpoint", "", "")
-		tokenEnv := fs.String("openclaw-token-env", "", "")
 		timeout := fs.Int("timeout-ms", 15000, "")
 		if fs.Parse(args[1:]) != nil || *id == "" || *catalog == "" || *dag == "" {
 			return bad(exitUsage, "run requires --id --catalog --dag")
@@ -80,19 +78,21 @@ func run(args []string) int {
 		if *adapter != "fixture" && *adapter != "openclaw" {
 			return bad(exitUsage, "--adapter must be fixture or openclaw")
 		}
-		if *adapter == "openclaw" && (*endpoint == "" || *tokenEnv == "") {
-			return bad(exitUsage, "openclaw adapter requires --openclaw-endpoint and --openclaw-token-env")
-		}
-		return request("POST", *base+"/api/v1/dispatch/run", *token, map[string]any{"id": *id, "name": *name, "catalog_id": *catalog, "dag_id": *dag, "adapter": *adapter, "fixture_mode": *mode, "endpoint": *endpoint, "token_env": *tokenEnv, "timeout_ms": *timeout}, os.Stdout)
+		return request("POST", *base+"/api/v1/dispatch/run", *token, map[string]any{"id": *id, "name": *name, "catalog_id": *catalog, "dag_id": *dag, "adapter": *adapter, "fixture_mode": *mode, "timeout_ms": *timeout}, os.Stdout)
 	case "control":
 		fs, base, token := remoteFlags("control")
 		runID := fs.String("run", "", "")
 		task := fs.String("task", "", "")
 		key := fs.String("idempotency-key", "", "")
+		fence := fs.Uint64("fencing-token", 0, "")
 		if fs.Parse(args[1:]) != nil || *runID == "" || fs.NArg() != 1 {
-			return bad(exitUsage, "control requires --run RUN [--task TASK] ACTION")
+			return bad(exitUsage, "control requires --run RUN [--task TASK] [--fencing-token TOKEN] ACTION")
 		}
-		return request("POST", fmt.Sprintf("%s/api/v1/runs/%s/controls/%s", *base, *runID, fs.Arg(0)), *token, map[string]any{"task_id": *task, "idempotency_key": *key}, os.Stdout)
+		action := fs.Arg(0)
+		if action != "emergency-stop" && *fence == 0 {
+			return bad(exitUsage, "control action requires a non-zero --fencing-token")
+		}
+		return request("POST", fmt.Sprintf("%s/api/v1/runs/%s/controls/%s", *base, *runID, action), *token, map[string]any{"task_id": *task, "idempotency_key": *key, "fencing_token": *fence}, os.Stdout)
 	case "approve":
 		fs, base, token := remoteFlags("approve")
 		runID := fs.String("run", "", "")
@@ -107,10 +107,11 @@ func run(args []string) int {
 		runID := fs.String("run", "", "")
 		key := fs.String("idempotency-key", "", "")
 		result := fs.String("result", "", "")
-		if fs.Parse(args[1:]) != nil || *runID == "" || *key == "" {
-			return bad(exitUsage, "reconcile requires --run and --idempotency-key")
+		evidence := fs.String("evidence", "", "")
+		if fs.Parse(args[1:]) != nil || *runID == "" || *key == "" || strings.TrimSpace(*result) == "" || strings.TrimSpace(*evidence) == "" {
+			return bad(exitUsage, "reconcile requires --run, --idempotency-key, --result and --evidence")
 		}
-		return request("POST", fmt.Sprintf("%s/api/v1/runs/%s/reconcile", *base, *runID), *token, map[string]any{"idempotency_key": *key, "result": *result}, os.Stdout)
+		return request("POST", fmt.Sprintf("%s/api/v1/runs/%s/reconcile", *base, *runID), *token, map[string]any{"idempotency_key": *key, "result": *result, "evidence": *evidence}, os.Stdout)
 	case "export":
 		fs, base, token := remoteFlags("export")
 		runID := fs.String("run", "", "")
@@ -163,6 +164,7 @@ func serve(args []string) int {
 	addr := fs.String("addr", "127.0.0.1:8080", "")
 	db := fs.String("db", "dispatch.db", "")
 	token := fs.String("auth-token", os.Getenv("N0DING_DISPATCH_AUTH_TOKEN"), "")
+	openclawEndpoint := fs.String("openclaw-endpoint", "", "")
 	if fs.Parse(args) != nil {
 		return bad(exitUsage, "invalid serve options")
 	}
@@ -183,7 +185,11 @@ func serve(args []string) int {
 	}
 	defer store.Close()
 	emit(os.Stdout, map[string]any{"ok": true, "product": "n0ding-dispatch", "address": *addr})
-	server := http.Server{Addr: *addr, Handler: httpapi.NewAuthenticated("dispatch", store, *token), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 1 << 20}
+	handler, e := httpapi.NewConfigured("dispatch", store, *token, *openclawEndpoint, os.Getenv("N0DING_DISPATCH_OPENCLAW_TOKEN"))
+	if e != nil {
+		return bad(exitUsage, e.Error())
+	}
+	server := http.Server{Addr: *addr, Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 1 << 20}
 	if e = server.ListenAndServe(); e != nil && e != http.ErrServerClosed {
 		return bad(exitTransport, e.Error())
 	}

@@ -134,6 +134,73 @@ func TestTopologicalOrdersChainsWithEqualDependencyCounts(t *testing.T) {
 	}
 }
 
+func TestSideEffectingTaskRequestsValidApprovalBeforeDispatch(t *testing.T) {
+	s, err := core.OpenStore(filepath.Join(t.TempDir(), "d.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	h := New("dispatch", s)
+	cat := `{"id":"side","catalog":{"Version":"v1","Capabilities":[{"Name":"write","Version":"v1","SideEffecting":true}],"Agents":[{"ID":"forge","Version":"v1","Capabilities":["write@v1"],"Priority":10,"Enabled":true,"MaxConcurrent":1}]}}`
+	if w := call(t, h, "POST", "/api/v1/agents", cat); w.Code != 201 {
+		t.Fatalf("catalog=%d %s", w.Code, w.Body.String())
+	}
+	dag := `{"id":"side-dag","dag":{"Version":"v1","Tasks":[{"ID":"publish","Version":"v1","Requires":["write@v1"],"Cost":1}],"MaxFanout":1,"Budget":1}}`
+	if w := call(t, h, "POST", "/api/v1/tasks", dag); w.Code != 201 {
+		t.Fatalf("dag=%d %s", w.Code, w.Body.String())
+	}
+	w := call(t, h, "POST", "/api/v1/dispatch/run", `{"id":"side-run","catalog_id":"side","dag_id":"side-dag","adapter":"fixture"}`)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("run=%d %s", w.Code, w.Body.String())
+	}
+	var request core.Event
+	for _, event := range s.Events("side-run", 0) {
+		if event.Type == "approval.requested" {
+			request = event
+		}
+		if event.Type == "command.requested" {
+			t.Fatal("side effect dispatched before approval")
+		}
+	}
+	digest := stringValue(request.Data["action_digest"])
+	if len(digest) != 64 {
+		t.Fatalf("invalid digest %q", digest)
+	}
+	w = call(t, h, "POST", "/api/v1/runs/side-run/approvals/"+digest+"/grant", `{"actor":"local-owner"}`)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("grant=%d %s", w.Code, w.Body.String())
+	}
+	seenCommand, seenCompleted := false, false
+	for _, event := range s.Events("side-run", 0) {
+		seenCommand = seenCommand || event.Type == "command.requested"
+		seenCompleted = seenCompleted || event.Type == "dispatch.completed"
+	}
+	if !seenCommand || !seenCompleted {
+		t.Fatal("approved side effect was not executed to an honest terminal")
+	}
+}
+
+func TestEmergencyStopIsRecoveredFailClosed(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "d.db")
+	s, _ := core.OpenStore(db)
+	h := New("dispatch", s)
+	seedDefinitions(t, h)
+	if w := call(t, h, "POST", "/api/v1/dispatch/run", `{"id":"stopped","catalog_id":"cat","dag_id":"dag"}`); w.Code != 201 {
+		t.Fatal(w.Body.String())
+	}
+	if w := call(t, h, "POST", "/api/v1/runs/stopped/controls/emergency-stop", `{"reason":"operator"}`); w.Code != 202 {
+		t.Fatal(w.Body.String())
+	}
+	_ = s.Close()
+	s, _ = core.OpenStore(db)
+	defer s.Close()
+	h = New("dispatch", s)
+	w := call(t, h, "POST", "/api/v1/runs/stopped/controls/resume", `{"task_id":"task-1","idempotency_key":"resume-after-restart","fencing_token":1}`)
+	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "emergency stop") {
+		t.Fatalf("control=%d %s", w.Code, w.Body.String())
+	}
+}
+
 func TestLostResponseRequiresReconciliation(t *testing.T) {
 	s, err := core.OpenStore(filepath.Join(t.TempDir(), "d.db"))
 	if err != nil {
@@ -178,17 +245,18 @@ func TestOpenClawRunUsesHTTPAdapterAndDoesNotPersistToken(t *testing.T) {
 		_, _ = w.Write([]byte(`{"task_id":"task-1","accepted":true}`))
 	}))
 	defer gateway.Close()
-	t.Setenv("N0DING_TEST_OPENCLAW_TOKEN", token)
-
 	db := filepath.Join(t.TempDir(), "dispatch.db")
 	s, err := core.OpenStore(db)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	h := New("dispatch", s)
+	h, err := NewConfigured("dispatch", s, "", gateway.URL, token)
+	if err != nil {
+		t.Fatal(err)
+	}
 	seedDefinitions(t, h)
-	body := `{"id":"openclaw","catalog_id":"cat","dag_id":"dag","adapter":"openclaw","endpoint":` + quote(gateway.URL) + `,"token_env":"N0DING_TEST_OPENCLAW_TOKEN","fixture_mode":"not-a-mode"}`
+	body := `{"id":"openclaw","catalog_id":"cat","dag_id":"dag","adapter":"openclaw","fixture_mode":"not-a-mode"}`
 	w := call(t, h, "POST", "/api/v1/dispatch/run", body)
 	if w.Code != http.StatusCreated {
 		t.Fatalf("run: %d %s", w.Code, w.Body.String())
@@ -218,6 +286,23 @@ func TestOpenClawRunUsesHTTPAdapterAndDoesNotPersistToken(t *testing.T) {
 	}
 }
 
+func TestRunCannotSelectOpenClawCredentialOrEndpoint(t *testing.T) {
+	s, err := core.OpenStore(filepath.Join(t.TempDir(), "dispatch.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	h := New("dispatch", s)
+	seedDefinitions(t, h)
+	for _, extra := range []string{`,"token_env":"HOME"`, `,"endpoint":"https://attacker.example"`} {
+		body := `{"id":"blocked","catalog_id":"cat","dag_id":"dag","adapter":"openclaw"` + extra + `}`
+		w := call(t, h, "POST", "/api/v1/dispatch/run", body)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("request-controlled OpenClaw configuration accepted: %d %s", w.Code, w.Body.String())
+		}
+	}
+}
+
 func TestUnknownAdapterFailsClosedBeforeCreatingRun(t *testing.T) {
 	s, err := core.OpenStore(filepath.Join(t.TempDir(), "dispatch.db"))
 	if err != nil {
@@ -233,11 +318,6 @@ func TestUnknownAdapterFailsClosedBeforeCreatingRun(t *testing.T) {
 	if _, ok := s.GetRun("bad"); ok {
 		t.Fatal("unknown adapter created a run")
 	}
-}
-
-func quote(v string) string {
-	b, _ := json.Marshal(v)
-	return string(b)
 }
 
 func TestRestartMarksRunningDispatchInterrupted(t *testing.T) {
