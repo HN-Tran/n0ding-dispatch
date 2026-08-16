@@ -221,7 +221,7 @@ func TestApprovalContinuationCompletesRemainingDAG(t *testing.T) {
 	if w := call(t, h, "POST", "/api/v1/agents", cat); w.Code != 201 {
 		t.Fatal(w.Body.String())
 	}
-	dag := `{"id":"chain-dag","dag":{"Version":"v1","Tasks":[{"ID":"first","Version":"v1","Requires":["read@v1"],"Cost":1},{"ID":"middle","Version":"v1","Requires":["write@v1"],"DependsOn":["first"],"Cost":1},{"ID":"last","Version":"v1","Requires":["read@v1"],"DependsOn":["middle"],"Cost":1}],"MaxFanout":2,"Budget":3}}`
+	dag := `{"id":"chain-dag","dag":{"Version":"v1","Tasks":[{"ID":"first","Version":"v1","Requires":["read@v1"],"Cost":1},{"ID":"middle","Version":"v1","Requires":["write@v1"],"DependsOn":["first"],"Cost":1},{"ID":"last","Version":"v1","Requires":["write@v1"],"DependsOn":["middle"],"Cost":1}],"MaxFanout":2,"Budget":3}}`
 	if w := call(t, h, "POST", "/api/v1/tasks", dag); w.Code != 201 {
 		t.Fatal(w.Body.String())
 	}
@@ -245,6 +245,21 @@ func TestApprovalContinuationCompletesRemainingDAG(t *testing.T) {
 	}
 	if w := call(t, h, "POST", "/api/v1/runs/chain/tasks/middle/result", ""); w.Code != 200 {
 		t.Fatalf("middle=%d %s", w.Code, w.Body.String())
+	}
+	var second string
+	for _, e := range s.Events("chain", 0) {
+		if e.Type == "approval.requested" {
+			candidate := stringValue(e.Data["action_digest"])
+			if candidate != digest {
+				second = candidate
+			}
+		}
+	}
+	if second == "" {
+		t.Fatal("second side-effect approval not requested")
+	}
+	if w := call(t, h, "POST", "/api/v1/runs/chain/approvals/"+second+"/grant", `{"actor":"local-owner"}`); w.Code != 202 {
+		t.Fatalf("second grant=%d %s", w.Code, w.Body.String())
 	}
 	if w := call(t, h, "POST", "/api/v1/runs/chain/tasks/last/result", ""); w.Code != 200 {
 		t.Fatalf("last=%d %s", w.Code, w.Body.String())
@@ -416,6 +431,23 @@ func TestResumeRotatesFenceAndReassignRequiresAgent(t *testing.T) {
 	w = call(t, h, "POST", "/api/v1/runs/rotate/controls/pause", `{"task_id":"task-1","idempotency_key":"stale","fencing_token":1}`)
 	if w.Code != 409 {
 		t.Fatalf("stale fence=%d %s", w.Code, w.Body.String())
+	}
+	w = call(t, h, "POST", "/api/v1/runs/rotate/controls/reassign", `{"task_id":"task-1","idempotency_key":"unknown-target","fencing_token":2,"agent":"not-in-catalog"}`)
+	if w.Code != 422 {
+		t.Fatalf("unknown target=%d %s", w.Code, w.Body.String())
+	}
+	w = call(t, h, "POST", "/api/v1/runs/rotate/controls/reassign", `{"task_id":"task-1","idempotency_key":"move","fencing_token":2,"agent":"scout"}`)
+	if w.Code != 202 || !strings.Contains(w.Body.String(), `"fence":3`) {
+		t.Fatalf("reassign=%d %s", w.Code, w.Body.String())
+	}
+	found := false
+	for _, event := range s.Events("rotate", 0) {
+		if event.Type == "routing.decided" && stringValue(event.Data["reason"]) == "operator_reassign" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("reassign routing evidence missing")
 	}
 }
 

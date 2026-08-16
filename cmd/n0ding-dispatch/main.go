@@ -32,7 +32,7 @@ func bad(code int, msg string) int {
 
 func run(args []string) int {
 	if len(args) == 0 {
-		return bad(exitUsage, "command required: init|serve|run|runs|control|approve|reconcile|export|doctor")
+		return bad(exitUsage, "command required: init|serve|run|runs|control|approve|check-result|reconcile|export|doctor")
 	}
 	switch args[0] {
 	case "init":
@@ -106,6 +106,14 @@ func run(args []string) int {
 			return bad(exitUsage, "approve requires --run and --digest")
 		}
 		return request("POST", fmt.Sprintf("%s/api/v1/runs/%s/approvals/%s/%s", *base, *runID, *digest, *decision), *token, map[string]any{}, os.Stdout)
+	case "check-result":
+		fs, base, token := remoteFlags("check-result")
+		runID := fs.String("run", "", "")
+		task := fs.String("task", "", "")
+		if fs.Parse(args[1:]) != nil || *runID == "" || *task == "" {
+			return bad(exitUsage, "check-result requires --run and --task")
+		}
+		return request("POST", fmt.Sprintf("%s/api/v1/runs/%s/tasks/%s/result", *base, *runID, *task), *token, map[string]any{}, os.Stdout)
 	case "reconcile":
 		fs, base, token := remoteFlags("reconcile")
 		runID := fs.String("run", "", "")

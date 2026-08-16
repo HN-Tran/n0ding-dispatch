@@ -69,6 +69,7 @@ const (
 	CommandOutcomeUnknown CommandState = "outcome_unknown"
 	CommandReconciled     CommandState = "reconciled"
 	CommandCancelled      CommandState = "cancelled"
+	CommandPolling        CommandState = "polling"
 )
 
 type Command struct {
@@ -157,7 +158,7 @@ func (c *Controller) Transition(key string, to CommandState, result, errText str
 	if !ok {
 		return Command{}, errors.New("unknown command")
 	}
-	allowed := map[CommandState]map[CommandState]bool{CommandRequested: {CommandAcknowledged: true, CommandFailed: true, CommandCancelled: true}, CommandAcknowledged: {CommandCompleted: true, CommandFailed: true, CommandOutcomeUnknown: true, CommandCancelled: true}, CommandOutcomeUnknown: {CommandReconciled: true}}
+	allowed := map[CommandState]map[CommandState]bool{CommandRequested: {CommandAcknowledged: true, CommandFailed: true, CommandCancelled: true}, CommandAcknowledged: {CommandCompleted: true, CommandFailed: true, CommandOutcomeUnknown: true, CommandCancelled: true, CommandPolling: true}, CommandPolling: {CommandAcknowledged: true, CommandCompleted: true, CommandFailed: true, CommandCancelled: true}, CommandOutcomeUnknown: {CommandReconciled: true}}
 	if !allowed[cmd.State][to] {
 		return Command{}, errors.New("invalid command transition")
 	}

@@ -41,7 +41,7 @@
         </section>
 
         <section class="panel control-panel">
-          <div class="panel-title"><div><span>CONTROL PLANE</span><h2 id="runTitle">Select a run</h2></div><div class="control-strip"><select id="reassignAgent" aria-label="Reassign target agent"><option value="">Select agent</option></select><button data-control="pause">Pause</button><button data-control="resume">Resume</button><button data-control="cancel">Cancel</button><button data-control="retry">Retry</button><button data-control="reassign">Reassign</button><button data-control="emergency-stop" class="danger">Emergency stop</button></div></div>
+          <div class="panel-title"><div><span>CONTROL PLANE</span><h2 id="runTitle">Select a run</h2></div><div class="control-strip"><select id="reassignAgent" aria-label="Reassign target agent"><option value="">Select agent</option></select><button id="checkResult">Check result</button><button data-control="pause">Pause</button><button data-control="resume">Resume</button><button data-control="cancel">Cancel</button><button data-control="retry">Retry</button><button data-control="reassign">Reassign</button><button data-control="emergency-stop" class="danger">Emergency stop</button></div></div>
           <p class="control-help" id="controlState">Controls emit requests. State changes only after a backend acknowledgement event.</p>
           <div id="replayControl" class="replay-control" hidden><label for="replayRange">Events through <output id="replayValue">0</output></label><input id="replayRange" type="range" min="0" max="0" value="0"></div>
         </section>

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,7 +17,7 @@ import (
 	"github.com/hn-tran/n0ding-dispatch/internal/dispatch"
 )
 
-type countingAdapter struct{ dispatches, controls atomic.Int32 }
+type countingAdapter struct{ dispatches, controls, results atomic.Int32 }
 
 func (a *countingAdapter) Dispatch(_ context.Context, r adapters.DispatchRequest) (adapters.Acknowledgement, error) {
 	a.dispatches.Add(1)
@@ -25,8 +26,55 @@ func (a *countingAdapter) Dispatch(_ context.Context, r adapters.DispatchRequest
 func (*countingAdapter) Heartbeat(context.Context, adapters.TaskRef) (adapters.Heartbeat, error) {
 	return adapters.Heartbeat{}, nil
 }
-func (*countingAdapter) Result(_ context.Context, r adapters.TaskRef) (adapters.Result, error) {
+
+func (a *countingAdapter) Result(_ context.Context, r adapters.TaskRef) (adapters.Result, error) {
+	a.results.Add(1)
+	time.Sleep(10 * time.Millisecond)
 	return adapters.Result{TaskID: r.TaskID, State: "running"}, nil
+}
+
+func TestConcurrentResultPollsAdapterOnce(t *testing.T) {
+	store := core.NewStore()
+	_ = store.CreateRun(core.Run{ID: "result", Mode: "dispatch"})
+	ctrl := dispatch.NewController()
+	adapter := &countingAdapter{}
+	s := &Server{Mode: "dispatch", Store: store, controllers: map[string]*dispatch.Controller{"result": ctrl}, adapters: map[string]adapters.Adapter{"result": adapter}, runTimeouts: map[string]time.Duration{"result": time.Second}, catalogs: map[string]dispatch.Catalog{}, dags: map[string]dispatch.TaskDAG{}, approvalClaims: map[string]bool{}}
+	if err := s.dispatchTask("result", dispatch.Task{ID: "task", Version: "v1"}, "agent"); err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/v1/runs/{id}/tasks/{task}/result", s.taskResult)
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			w := httptest.NewRecorder()
+			mux.ServeHTTP(w, httptest.NewRequest("POST", "/api/v1/runs/result/tasks/task/result", nil))
+		}()
+	}
+	wg.Wait()
+	if got := adapter.results.Load(); got != 1 {
+		t.Fatalf("result calls=%d", got)
+	}
+}
+
+func TestCriticalAppendFailureMakesHealthUnready(t *testing.T) {
+	store, err := core.OpenStore(filepath.Join(t.TempDir(), "d.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = store.CreateRun(core.Run{ID: "health", Mode: "dispatch"})
+	_ = store.Close()
+	s := &Server{Mode: "dispatch", Store: store}
+	if _, err = s.appendCritical("health", "command.requested", map[string]any{}); err == nil {
+		t.Fatal("expected append failure")
+	}
+	w := httptest.NewRecorder()
+	s.health(w, httptest.NewRequest("GET", "/healthz", nil))
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("health=%d", w.Code)
+	}
 }
 func (a *countingAdapter) control(r adapters.ControlRequest) (adapters.Acknowledgement, error) {
 	a.controls.Add(1)

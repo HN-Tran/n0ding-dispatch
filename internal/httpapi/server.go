@@ -30,6 +30,7 @@ type Server struct {
 	approvalClaims map[string]bool
 	openclaw       adapters.Adapter
 	mutations      []time.Time
+	fatalErr       string
 }
 
 const maxBodyBytes int64 = 1 << 20
@@ -178,7 +179,24 @@ func write(w http.ResponseWriter, status int, v any) {
 }
 
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
+	s.mu.Lock()
+	fatal := s.fatalErr
+	s.mu.Unlock()
+	if fatal != "" {
+		write(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "mode": s.Mode, "error": "durable event append failed"})
+		return
+	}
 	write(w, http.StatusOK, map[string]any{"ok": true, "mode": s.Mode})
+}
+
+func (s *Server) appendCritical(runID, typ string, data map[string]any) (core.Event, error) {
+	e, err := s.Store.Append(runID, typ, data)
+	if err != nil {
+		s.mu.Lock()
+		s.fatalErr = err.Error()
+		s.mu.Unlock()
+	}
+	return e, err
 }
 
 func (s *Server) listRuns(w http.ResponseWriter, _ *http.Request) {
