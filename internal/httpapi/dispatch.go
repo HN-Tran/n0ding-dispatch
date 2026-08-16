@@ -41,7 +41,7 @@ func (s *Server) recoverInterrupted() {
 	for _, r := range s.Store.ListRuns("dispatch") {
 		p, _ := s.Store.Replay(r.ID, 0)
 		if p.Status == "running" {
-			_, _ = s.Store.Append(r.ID, "dispatch.interrupted", map[string]any{"reason": "process_restart", "reconciliation_required": true})
+			_, _ = s.appendCritical(r.ID, "dispatch.interrupted", map[string]any{"reason": "process_restart", "reconciliation_required": true})
 		}
 	}
 }
@@ -265,7 +265,10 @@ func (s *Server) startDispatch(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = timeout
 	if err := s.scheduleRun(in.ID, catalog, dag); err != nil {
-		_, _ = s.Store.Append(in.ID, "dispatch.failed", map[string]any{"error": err.Error()})
+		if _, appendErr := s.appendCritical(in.ID, "dispatch.failed", map[string]any{"error": err.Error()}); appendErr != nil {
+			write(w, 500, map[string]string{"error": "durable terminal append failed"})
+			return
+		}
 		write(w, 422, map[string]string{"error": err.Error()})
 		return
 	}
@@ -624,7 +627,10 @@ func (s *Server) control(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if action == "retry" {
-		_, _ = s.Store.Append(id, "dispatch.resumed", map[string]any{"reason": "safe_retry", "task_id": in.TaskID})
+		if _, appendErr := s.appendCritical(id, "dispatch.resumed", map[string]any{"reason": "safe_retry", "task_id": in.TaskID}); appendErr != nil {
+			write(w, 500, map[string]string{"error": "durable resume append failed"})
+			return
+		}
 		retryKey := id + ":" + in.TaskID + ":dispatch:retry:" + in.IdempotencyKey
 		retryCmd, created, retryErr := ctrl.RequestOnce(dispatch.Command{ID: retryKey, IdempotencyKey: retryKey, TaskID: in.TaskID, Fence: in.FencingToken}, time.Now())
 		if retryErr != nil {
@@ -632,9 +638,15 @@ func (s *Server) control(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if created {
-			_, _ = s.Store.Append(id, "command.requested", commandData(retryCmd, "dispatch_retry"))
+			if _, appendErr := s.appendCritical(id, "command.requested", commandData(retryCmd, "dispatch_retry")); appendErr != nil {
+				write(w, 500, map[string]string{"error": "durable retry command append failed"})
+				return
+			}
 			retryCmd, _ = ctrl.Transition(retryKey, dispatch.CommandAcknowledged, "", "", time.Now())
-			_, _ = s.Store.Append(id, "command.acknowledged", commandData(retryCmd, "dispatch_retry"))
+			if _, appendErr := s.appendCritical(id, "command.acknowledged", commandData(retryCmd, "dispatch_retry")); appendErr != nil {
+				write(w, 500, map[string]string{"error": "durable retry acknowledgement failed"})
+				return
+			}
 		}
 	}
 	write(w, 202, cmd)
@@ -800,14 +812,20 @@ func (s *Server) approve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	} else if taskID != "" {
-		_, _ = s.Store.Append(id, "dispatch.resumed", map[string]any{"reason": "approval_granted", "task_id": taskID})
+		if _, appendErr := s.appendCritical(id, "dispatch.resumed", map[string]any{"reason": "approval_granted", "task_id": taskID}); appendErr != nil {
+			write(w, 500, map[string]string{"error": "durable resume append failed"})
+			return
+		}
 		catalog, dag, ok := s.runDefinitions(id)
 		if !ok {
 			write(w, 409, map[string]string{"error": "run definitions unavailable"})
 			return
 		}
 		if err := s.scheduleRun(id, catalog, dag); err != nil {
-			_, _ = s.Store.Append(id, "dispatch.failed", map[string]any{"error": err.Error()})
+			if _, appendErr := s.appendCritical(id, "dispatch.failed", map[string]any{"error": err.Error()}); appendErr != nil {
+				write(w, 500, map[string]string{"error": "durable terminal append failed"})
+				return
+			}
 			write(w, 422, map[string]string{"error": err.Error()})
 			return
 		}
@@ -1028,9 +1046,15 @@ func (s *Server) reconcile(w http.ResponseWriter, r *http.Request) {
 	}
 	if !pending {
 		if failed {
-			_, _ = s.Store.Append(id, "dispatch.failed", map[string]any{"outcome": "reconciled_with_failures"})
+			if _, appendErr := s.appendCritical(id, "dispatch.failed", map[string]any{"outcome": "reconciled_with_failures"}); appendErr != nil {
+				write(w, 500, map[string]string{"error": "durable terminal append failed"})
+				return
+			}
 		} else if in.Disposition == "applied" && s.allTasksCompleted(id) {
-			_, _ = s.Store.Append(id, "dispatch.completed", map[string]any{"outcome": "reconciled_applied"})
+			if _, appendErr := s.appendCritical(id, "dispatch.completed", map[string]any{"outcome": "reconciled_applied"}); appendErr != nil {
+				write(w, 500, map[string]string{"error": "durable terminal append failed"})
+				return
+			}
 		}
 	}
 	write(w, 202, map[string]any{"reconciled": true, "command": cmd})

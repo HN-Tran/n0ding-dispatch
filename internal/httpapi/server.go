@@ -134,6 +134,13 @@ func (s *Server) security(next http.Handler) http.Handler {
 			}
 		}
 		if r.Method != http.MethodGet && r.Method != http.MethodHead && strings.HasPrefix(r.URL.Path, "/api/") {
+			s.mu.Lock()
+			fatal := s.fatalErr
+			s.mu.Unlock()
+			if fatal != "" {
+				write(w, http.StatusServiceUnavailable, map[string]string{"error": "durable event store is unhealthy; restart and recover before mutations"})
+				return
+			}
 			if strings.EqualFold(r.Header.Get("Sec-Fetch-Site"), "cross-site") {
 				write(w, http.StatusForbidden, map[string]string{"error": "cross-site mutation rejected"})
 				return
@@ -233,7 +240,7 @@ func (s *Server) appendEvent(w http.ResponseWriter, r *http.Request) {
 		write(w, http.StatusBadRequest, map[string]string{"error": "type required"})
 		return
 	}
-	e, err := s.Store.Append(r.PathValue("id"), x.Type, x.Data)
+	e, err := s.appendCritical(r.PathValue("id"), x.Type, x.Data)
 	if err != nil {
 		write(w, http.StatusNotFound, map[string]string{"error": err.Error()})
 		return

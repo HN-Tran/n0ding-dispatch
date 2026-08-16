@@ -18,6 +18,17 @@ import (
 )
 
 type countingAdapter struct{ dispatches, controls, results atomic.Int32 }
+type blockingAdapter struct {
+	countingAdapter
+	started chan struct{}
+	release chan struct{}
+}
+
+func (a *blockingAdapter) Dispatch(_ context.Context, r adapters.DispatchRequest) (adapters.Acknowledgement, error) {
+	close(a.started)
+	<-a.release
+	return adapters.Acknowledgement{TaskID: r.TaskID, Accepted: true}, nil
+}
 
 func (a *countingAdapter) Dispatch(_ context.Context, r adapters.DispatchRequest) (adapters.Acknowledgement, error) {
 	a.dispatches.Add(1)
@@ -66,9 +77,41 @@ func TestCriticalAppendFailureMakesHealthUnready(t *testing.T) {
 	}
 	_ = store.CreateRun(core.Run{ID: "health", Mode: "dispatch"})
 	_ = store.Close()
-	s := &Server{Mode: "dispatch", Store: store}
-	if _, err = s.appendCritical("health", "command.requested", map[string]any{}); err == nil {
+	adapter := &countingAdapter{}
+	s := &Server{Mode: "dispatch", Store: store, controllers: map[string]*dispatch.Controller{"health": dispatch.NewController()}, adapters: map[string]adapters.Adapter{"health": adapter}, runTimeouts: map[string]time.Duration{"health": time.Second}}
+	if err = s.dispatchTask("health", dispatch.Task{ID: "task", Version: "v1"}, "agent"); err == nil {
 		t.Fatal("expected append failure")
+	}
+	if adapter.dispatches.Load() != 0 {
+		t.Fatal("adapter ran without durable request evidence")
+	}
+	w := httptest.NewRecorder()
+	s.health(w, httptest.NewRequest("GET", "/healthz", nil))
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("health=%d", w.Code)
+	}
+	called := false
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/test", func(http.ResponseWriter, *http.Request) { called = true })
+	guarded := s.security(mux)
+	w = httptest.NewRecorder()
+	guarded.ServeHTTP(w, httptest.NewRequest("POST", "/api/test", nil))
+	if w.Code != http.StatusServiceUnavailable || called {
+		t.Fatalf("mutation was not blocked: status=%d called=%v", w.Code, called)
+	}
+}
+func TestTerminalAppendFailureAfterAdapterLatchesHealth(t *testing.T) {
+	store, _ := core.OpenStore(filepath.Join(t.TempDir(), "d.db"))
+	_ = store.CreateRun(core.Run{ID: "terminal", Mode: "dispatch"})
+	adapter := &blockingAdapter{started: make(chan struct{}), release: make(chan struct{})}
+	s := &Server{Mode: "dispatch", Store: store, controllers: map[string]*dispatch.Controller{"terminal": dispatch.NewController()}, adapters: map[string]adapters.Adapter{"terminal": adapter}, runTimeouts: map[string]time.Duration{"terminal": time.Second}}
+	done := make(chan error, 1)
+	go func() { done <- s.dispatchTask("terminal", dispatch.Task{ID: "task", Version: "v1"}, "agent") }()
+	<-adapter.started
+	_ = store.Close()
+	close(adapter.release)
+	if err := <-done; err == nil {
+		t.Fatal("expected terminal append failure")
 	}
 	w := httptest.NewRecorder()
 	s.health(w, httptest.NewRequest("GET", "/healthz", nil))
