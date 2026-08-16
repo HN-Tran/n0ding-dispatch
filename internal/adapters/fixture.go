@@ -102,3 +102,21 @@ func (f *Fixture) Cancel(ctx context.Context, r ControlRequest) (Acknowledgement
 	f.mu.Unlock()
 	return Acknowledgement{TaskID: r.TaskID, Accepted: true}, nil
 }
+func (f *Fixture) Resume(ctx context.Context, r ControlRequest) (Acknowledgement, error) {
+	return f.setControl(ctx, "resume", r, "running")
+}
+func (f *Fixture) Retry(ctx context.Context, r ControlRequest) (Acknowledgement, error) {
+	return f.setControl(ctx, "retry", r, "running")
+}
+func (f *Fixture) Reassign(ctx context.Context, r ControlRequest) (Acknowledgement, error) {
+	return f.setControl(ctx, "reassign", r, "running")
+}
+func (f *Fixture) setControl(ctx context.Context, op string, r ControlRequest, state string) (Acknowledgement, error) {
+	if err := f.operation(ctx, op, r.TaskID, true); err != nil {
+		return Acknowledgement{}, err
+	}
+	f.mu.Lock()
+	f.tasks[r.TaskID] = state
+	f.mu.Unlock()
+	return Acknowledgement{TaskID: r.TaskID, Accepted: true}, nil
+}

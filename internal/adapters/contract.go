@@ -13,6 +13,9 @@ type Adapter interface {
 	Result(context.Context, TaskRef) (Result, error)
 	Pause(context.Context, ControlRequest) (Acknowledgement, error)
 	Cancel(context.Context, ControlRequest) (Acknowledgement, error)
+	Resume(context.Context, ControlRequest) (Acknowledgement, error)
+	Retry(context.Context, ControlRequest) (Acknowledgement, error)
+	Reassign(context.Context, ControlRequest) (Acknowledgement, error)
 }
 
 type DispatchRequest struct {
@@ -31,6 +34,7 @@ type ControlRequest struct {
 	TaskID         string `json:"task_id"`
 	IdempotencyKey string `json:"idempotency_key"`
 	FencingToken   uint64 `json:"fencing_token"`
+	Agent          string `json:"agent,omitempty"`
 }
 
 type Acknowledgement struct {

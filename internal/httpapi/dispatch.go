@@ -51,6 +51,11 @@ func (s *Server) recoverControllers() {
 		latest := map[string]dispatch.Command{}
 		stopped, stopReason := false, ""
 		for _, event := range s.Store.Events(run.ID, 0) {
+			if event.Type == "dispatch.started" {
+				if ms := uint64Number(event.Data["timeout_ms"]); ms > 0 {
+					s.runTimeouts[run.ID] = time.Duration(ms) * time.Millisecond
+				}
+			}
 			if event.Type == "dispatch.emergency_stopped" {
 				stopped, stopReason = true, stringValue(event.Data["reason"])
 			}
@@ -252,8 +257,9 @@ func (s *Server) startDispatch(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	s.controllers[in.ID] = ctrl
 	s.adapters[in.ID] = adapter
+	s.runTimeouts[in.ID] = timeout
 	s.mu.Unlock()
-	_, _ = s.Store.Append(in.ID, "dispatch.started", map[string]any{"catalog_id": in.CatalogID, "dag_id": in.DAGID, "catalog_version": catalog.Version, "dag_version": dag.Version, "adapter": defaultString(in.Adapter, "fixture"), "fixture_mode": in.FixtureMode})
+	_, _ = s.Store.Append(in.ID, "dispatch.started", map[string]any{"catalog_id": in.CatalogID, "dag_id": in.DAGID, "catalog_version": catalog.Version, "dag_version": dag.Version, "adapter": defaultString(in.Adapter, "fixture"), "fixture_mode": in.FixtureMode, "timeout_ms": timeout.Milliseconds()})
 	_ = timeout
 	if err := s.scheduleRun(in.ID, catalog, dag); err != nil {
 		_, _ = s.Store.Append(in.ID, "dispatch.failed", map[string]any{"error": err.Error()})
@@ -349,9 +355,12 @@ func (s *Server) dispatchTask(id string, task dispatch.Task, agent string) error
 		return err
 	}
 	_, _ = s.Store.Append(id, "command.requested", commandData(cmd, "dispatch"))
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), s.timeoutFor(id))
 	ack, err := adapter.Dispatch(ctx, adapters.DispatchRequest{TaskID: task.ID, Agent: agent, IdempotencyKey: key, FencingToken: fence})
 	cancel()
+	if err == nil && (ack.TaskID != task.ID || !ack.Accepted) {
+		err = fmt.Errorf("dispatch rejected or returned mismatched task_id")
+	}
 	if err != nil {
 		if adapters.IsOutcomeUnknown(err) {
 			cmd, _ = ctrl.Transition(key, dispatch.CommandAcknowledged, "", "", time.Now())
@@ -369,6 +378,15 @@ func (s *Server) dispatchTask(id string, task dispatch.Task, agent string) error
 	_, _ = s.Store.Append(id, "command.acknowledged", commandData(cmd, "dispatch"))
 	_, _ = s.Store.Append(id, "task.delegated", map[string]any{"task_id": task.ID, "agent_id": agent, "accepted": ack.Accepted, "fencing_token": fence})
 	return nil
+}
+
+func (s *Server) timeoutFor(id string) time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if d := s.runTimeouts[id]; d > 0 {
+		return d
+	}
+	return 15 * time.Second
 }
 
 func topological(tasks []dispatch.Task) ([]dispatch.Task, error) {
@@ -481,7 +499,7 @@ func (s *Server) control(w http.ResponseWriter, r *http.Request) {
 		write(w, 202, cmd)
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), s.timeoutFor(id))
 	defer cancel()
 	var ack adapters.Acknowledgement
 	switch action {
@@ -489,8 +507,12 @@ func (s *Server) control(w http.ResponseWriter, r *http.Request) {
 		ack, err = adapter.Pause(ctx, adapters.ControlRequest{TaskID: in.TaskID, IdempotencyKey: in.IdempotencyKey, FencingToken: in.FencingToken})
 	case "cancel":
 		ack, err = adapter.Cancel(ctx, adapters.ControlRequest{TaskID: in.TaskID, IdempotencyKey: in.IdempotencyKey, FencingToken: in.FencingToken})
-	default:
-		ack = adapters.Acknowledgement{TaskID: in.TaskID, Accepted: true}
+	case "resume":
+		ack, err = adapter.Resume(ctx, adapters.ControlRequest{TaskID: in.TaskID, IdempotencyKey: in.IdempotencyKey, FencingToken: in.FencingToken})
+	case "retry":
+		ack, err = adapter.Retry(ctx, adapters.ControlRequest{TaskID: in.TaskID, IdempotencyKey: in.IdempotencyKey, FencingToken: in.FencingToken})
+	case "reassign":
+		ack, err = adapter.Reassign(ctx, adapters.ControlRequest{TaskID: in.TaskID, IdempotencyKey: in.IdempotencyKey, FencingToken: in.FencingToken, Agent: in.Agent})
 	}
 	if err != nil {
 		if adapters.IsOutcomeUnknown(err) {
@@ -501,6 +523,12 @@ func (s *Server) control(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		cmd, _ = ctrl.Transition(in.IdempotencyKey, dispatch.CommandFailed, "", err.Error(), time.Now())
+		_, _ = s.Store.Append(id, "control.failed", commandData(cmd, action))
+		write(w, 502, cmd)
+		return
+	}
+	if ack.TaskID != in.TaskID || !ack.Accepted {
+		cmd, _ = ctrl.Transition(in.IdempotencyKey, dispatch.CommandFailed, "", "control rejected or returned mismatched task_id", time.Now())
 		_, _ = s.Store.Append(id, "control.failed", commandData(cmd, action))
 		write(w, 502, cmd)
 		return
@@ -582,6 +610,10 @@ func (s *Server) approve(w http.ResponseWriter, r *http.Request) {
 			write(w, http.StatusOK, map[string]any{"accepted": true, "action_digest": digest, "decision": "grant", "idempotent": true})
 			return
 		}
+		if event.Type == "approval.denied" && stringValue(event.Data["action_digest"]) == digest {
+			write(w, http.StatusOK, map[string]any{"accepted": true, "action_digest": digest, "decision": "deny", "idempotent": true})
+			return
+		}
 	}
 	if decision == "grant" && taskID != "" {
 		s.mu.Lock()
@@ -646,11 +678,15 @@ func (s *Server) taskResult(w http.ResponseWriter, r *http.Request) {
 		write(w, 409, map[string]string{"error": "task is not awaiting a result"})
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), s.timeoutFor(id))
 	result, err := adapter.Result(ctx, adapters.TaskRef{TaskID: taskID})
 	cancel()
 	if err != nil {
 		write(w, 502, map[string]string{"error": err.Error()})
+		return
+	}
+	if result.TaskID != taskID {
+		write(w, 502, map[string]string{"error": "result returned mismatched task_id"})
 		return
 	}
 	if result.State != "completed" && result.State != "failed" && result.State != "cancelled" {
@@ -662,6 +698,14 @@ func (s *Server) taskResult(w http.ResponseWriter, r *http.Request) {
 		_, _ = s.Store.Append(id, "command.failed", commandData(cmd, "dispatch"))
 		_, _ = s.Store.Append(id, "task.failed", map[string]any{"task_id": taskID, "result": result})
 		_, _ = s.Store.Append(id, "dispatch.failed", map[string]any{"outcome": "failed"})
+		write(w, 200, result)
+		return
+	}
+	if result.State == "cancelled" {
+		cmd, _ = ctrl.Transition(key, dispatch.CommandCompleted, "cancelled", "", time.Now())
+		_, _ = s.Store.Append(id, "command.completed", commandData(cmd, "dispatch"))
+		_, _ = s.Store.Append(id, "task.cancelled", map[string]any{"task_id": taskID, "result": result})
+		_, _ = s.Store.Append(id, "dispatch.cancelled", map[string]any{"outcome": "cancelled"})
 		write(w, 200, result)
 		return
 	}

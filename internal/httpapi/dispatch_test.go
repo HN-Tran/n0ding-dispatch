@@ -255,6 +255,88 @@ func TestApprovalContinuationCompletesRemainingDAG(t *testing.T) {
 	}
 }
 
+func TestPerRunTimeoutIsEffectiveAndPersisted(t *testing.T) {
+	s, _ := core.OpenStore(filepath.Join(t.TempDir(), "d.db"))
+	defer s.Close()
+	h := New("dispatch", s)
+	seedDefinitions(t, h)
+	started := time.Now()
+	w := call(t, h, "POST", "/api/v1/dispatch/run", `{"id":"timeout","catalog_id":"cat","dag_id":"dag","fixture_mode":"timeout","timeout_ms":10}`)
+	if w.Code != 201 || time.Since(started) > 500*time.Millisecond {
+		t.Fatalf("status=%d elapsed=%s", w.Code, time.Since(started))
+	}
+	found := false
+	for _, e := range s.Events("timeout", 0) {
+		if e.Type == "dispatch.started" && uint64Number(e.Data["timeout_ms"]) == 10 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("effective timeout was not persisted")
+	}
+}
+
+func TestOpenClawRejectedOrMismatchedAckFailsClosed(t *testing.T) {
+	for _, body := range []string{`{"task_id":"task-1","accepted":false}`, `{"task_id":"other","accepted":true}`} {
+		t.Run(body, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(body))
+			}))
+			defer upstream.Close()
+			s, _ := core.OpenStore(filepath.Join(t.TempDir(), "d.db"))
+			defer s.Close()
+			h, err := NewConfigured("dispatch", s, "", upstream.URL, "token")
+			if err != nil {
+				t.Fatal(err)
+			}
+			seedDefinitions(t, h)
+			w := call(t, h, "POST", "/api/v1/dispatch/run", `{"id":"oc","catalog_id":"cat","dag_id":"dag","adapter":"openclaw"}`)
+			if w.Code != 201 {
+				t.Fatalf("run=%d %s", w.Code, w.Body.String())
+			}
+			for _, e := range s.Events("oc", 0) {
+				if e.Type == "task.delegated" {
+					t.Fatal("rejected/mismatched acknowledgement delegated task")
+				}
+			}
+			p, _ := s.Replay("oc", 0)
+			if p.Status != "failed" {
+				t.Fatalf("status=%s", p.Status)
+			}
+		})
+	}
+}
+
+func TestCancelledResultDoesNotReleaseDependencies(t *testing.T) {
+	s, _ := core.OpenStore(filepath.Join(t.TempDir(), "d.db"))
+	defer s.Close()
+	h := New("dispatch", s)
+	cat, _ := seedDefinitions(t, h)
+	dag := `{"id":"cancel-dag","dag":{"Version":"v1","Tasks":[{"ID":"task-1","Version":"v1","Requires":["research@v1"],"Cost":1},{"ID":"task-2","Version":"v1","Requires":["research@v1"],"DependsOn":["task-1"],"Cost":1}],"MaxFanout":2,"Budget":2}}`
+	if w := call(t, h, "POST", "/api/v1/tasks", dag); w.Code != 201 {
+		t.Fatal(w.Body.String())
+	}
+	if w := call(t, h, "POST", "/api/v1/dispatch/run", `{"id":"cancelled","catalog_id":"`+cat+`","dag_id":"cancel-dag"}`); w.Code != 201 {
+		t.Fatal(w.Body.String())
+	}
+	if w := call(t, h, "POST", "/api/v1/runs/cancelled/controls/cancel", `{"task_id":"task-1","idempotency_key":"cancel-1","fencing_token":1}`); w.Code != 202 {
+		t.Fatal(w.Body.String())
+	}
+	if w := call(t, h, "POST", "/api/v1/runs/cancelled/tasks/task-1/result", ""); w.Code != 200 {
+		t.Fatal(w.Body.String())
+	}
+	p, _ := s.Replay("cancelled", 0)
+	if p.Status != "cancelled" {
+		t.Fatalf("status=%s", p.Status)
+	}
+	for _, e := range s.Events("cancelled", 0) {
+		if e.Type == "command.requested" && stringValue(e.Data["task_id"]) == "task-2" {
+			t.Fatal("cancelled dependency released downstream task")
+		}
+	}
+}
+
 func TestLostResponseRequiresReconciliation(t *testing.T) {
 	s, err := core.OpenStore(filepath.Join(t.TempDir(), "d.db"))
 	if err != nil {

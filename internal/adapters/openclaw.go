@@ -125,6 +125,21 @@ func (o *OpenClawHTTP) Cancel(ctx context.Context, v ControlRequest) (Acknowledg
 	err := o.call(ctx, "cancel", true, v, &out)
 	return out, err
 }
+func (o *OpenClawHTTP) Resume(ctx context.Context, v ControlRequest) (Acknowledgement, error) {
+	var out Acknowledgement
+	err := o.call(ctx, "resume", true, v, &out)
+	return out, err
+}
+func (o *OpenClawHTTP) Retry(ctx context.Context, v ControlRequest) (Acknowledgement, error) {
+	var out Acknowledgement
+	err := o.call(ctx, "retry", true, v, &out)
+	return out, err
+}
+func (o *OpenClawHTTP) Reassign(ctx context.Context, v ControlRequest) (Acknowledgement, error) {
+	var out Acknowledgement
+	err := o.call(ctx, "reassign", true, v, &out)
+	return out, err
+}
 
 func (o *OpenClawHTTP) call(ctx context.Context, op string, sideEffect bool, input, output any) error {
 	b, err := json.Marshal(input)

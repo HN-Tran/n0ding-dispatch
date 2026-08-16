@@ -26,6 +26,7 @@ type Server struct {
 	dags        map[string]dispatch.TaskDAG
 	controllers map[string]*dispatch.Controller
 	adapters    map[string]adapters.Adapter
+	runTimeouts map[string]time.Duration
 	openclaw    adapters.Adapter
 	mutations   []time.Time
 }
@@ -56,7 +57,7 @@ func NewConfigured(mode string, store *core.Store, token, openclawEndpoint, open
 			return nil, err
 		}
 	}
-	s := &Server{Mode: mode, Store: store, Token: token, catalogs: map[string]dispatch.Catalog{}, dags: map[string]dispatch.TaskDAG{}, controllers: map[string]*dispatch.Controller{}, adapters: map[string]adapters.Adapter{}, openclaw: openclaw}
+	s := &Server{Mode: mode, Store: store, Token: token, catalogs: map[string]dispatch.Catalog{}, dags: map[string]dispatch.TaskDAG{}, controllers: map[string]*dispatch.Controller{}, adapters: map[string]adapters.Adapter{}, runTimeouts: map[string]time.Duration{}, openclaw: openclaw}
 	s.loadDefinitions()
 	s.recoverControllers()
 	s.recoverAdapters()
