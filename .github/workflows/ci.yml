@@ -1,0 +1,29 @@
+name: ci
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: {go-version: '1.25.x', cache: true}
+      - run: go test ./...
+      - run: go test -race ./...
+      - run: go vet ./...
+      - run: go build -trimpath ./cmd/n0ding-dispatch
+      - run: mkdir -p bin && go build -trimpath -o bin/n0ding-dispatch ./cmd/n0ding-dispatch && sh scripts/package-smoke.sh
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with: {context: ., push: false, load: true, tags: 'n0ding-dispatch:ci'}
+      - run: docker run -d --rm --name dispatch-smoke -p 18080:8080 -e N0DING_DISPATCH_AUTH_TOKEN=ci-smoke n0ding-dispatch:ci
+      - run: |
+          for i in $(seq 1 50); do curl -fsS http://127.0.0.1:18080/healthz && exit 0; sleep .2; done
+          docker logs dispatch-smoke; exit 1
+      - if: always()
+        run: docker stop dispatch-smoke || true

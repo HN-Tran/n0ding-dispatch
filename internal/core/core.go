@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hn-tran/n0ding-lab/internal/persistence"
+	"github.com/hn-tran/n0ding-dispatch/internal/persistence"
 )
 
 type Event struct {
@@ -68,7 +68,7 @@ func (e *Event) UnmarshalJSON(raw []byte) error {
 	if err := dec.Decode(&v); err != nil {
 		return err
 	}
-	if v.SchemaVersion != "1.0" || v.EventID == "" || v.RunID == "" || v.Sequence < 1 || v.OccurredAt.IsZero() || !v.RecordedAt.Equal(v.OccurredAt) || v.Source.Component != "prototype" || (v.Source.Product != "bench" && v.Source.Product != "dispatch") || !eventTypePattern.MatchString(v.Type) || v.Subject.Kind != "run" || v.Subject.ID != v.RunID || v.Payload == nil || !v.Redaction.Applied {
+	if v.SchemaVersion != "1.0" || v.EventID == "" || v.RunID == "" || v.Sequence < 1 || v.OccurredAt.IsZero() || !v.RecordedAt.Equal(v.OccurredAt) || v.Source.Component != "prototype" || v.Source.Product != "dispatch" || !eventTypePattern.MatchString(v.Type) || v.Subject.Kind != "run" || v.Subject.ID != v.RunID || v.Payload == nil || !v.Redaction.Applied {
 		return errors.New("invalid canonical event envelope")
 	}
 	if _, err := fmt.Sscan(v.EventID, &e.ID); err != nil || e.ID < 1 {
@@ -107,6 +107,46 @@ type Store struct {
 	nextID int64
 	notify chan struct{}
 	db     *persistence.SQLite
+}
+
+func (s *Store) SaveDefinition(kind, id string, value any) error {
+	if kind == "" || id == "" || len(kind) > 64 || len(id) > 128 {
+		return errors.New("definition kind and id required")
+	}
+	b, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	if len(b) > 1<<20 {
+		return errors.New("definition too large")
+	}
+	var clean any
+	if err := json.Unmarshal(b, &clean); err != nil {
+		return err
+	}
+	b, err = json.Marshal(redactValue(clean))
+	if err != nil {
+		return err
+	}
+	if s.db == nil {
+		return errors.New("durable store required for definitions")
+	}
+	return s.db.SaveDefinition(kind, id, b)
+}
+
+func (s *Store) Definitions(kind string) (map[string]json.RawMessage, error) {
+	if s.db == nil {
+		return map[string]json.RawMessage{}, nil
+	}
+	raw, err := s.db.Definitions(kind)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]json.RawMessage{}
+	for id, b := range raw {
+		out[id] = json.RawMessage(b)
+	}
+	return out, nil
 }
 
 func NewStore() *Store {
@@ -240,6 +280,12 @@ func nextStatus(current, typ string) string {
 		return "completed"
 	case strings.HasSuffix(typ, ".failed"):
 		return "failed"
+	case strings.HasSuffix(typ, ".cancelled"):
+		return "cancelled"
+	case strings.HasSuffix(typ, ".interrupted"):
+		return "interrupted"
+	case strings.HasSuffix(typ, ".emergency_stopped"):
+		return "stopped"
 	default:
 		return current
 	}
@@ -314,6 +360,12 @@ func (s *Store) Replay(runID string, upto int64) (Projection, error) {
 			p.Status = "completed"
 		case strings.HasSuffix(e.Type, ".failed"):
 			p.Status = "failed"
+		case strings.HasSuffix(e.Type, ".cancelled"):
+			p.Status = "cancelled"
+		case strings.HasSuffix(e.Type, ".interrupted"):
+			p.Status = "interrupted"
+		case strings.HasSuffix(e.Type, ".emergency_stopped"):
+			p.Status = "stopped"
 		case e.Type == "artifact.created":
 			if v, ok := e.Data["name"].(string); ok {
 				p.Artifacts = append(p.Artifacts, v)

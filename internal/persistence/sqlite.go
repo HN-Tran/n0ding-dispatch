@@ -37,6 +37,7 @@ func Open(path string) (*SQLite, error) {
 		`CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, mode TEXT NOT NULL, name TEXT NOT NULL, created_at TEXT NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT NOT NULL UNIQUE, run_id TEXT NOT NULL REFERENCES runs(id), sequence INTEGER NOT NULL, source TEXT NOT NULL, type TEXT NOT NULL, at TEXT NOT NULL, data BLOB NOT NULL, UNIQUE(run_id, sequence))`,
 		`CREATE TABLE IF NOT EXISTS projections (run_id TEXT PRIMARY KEY REFERENCES runs(id), status TEXT NOT NULL, steps INTEGER NOT NULL, last_event_id INTEGER NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS definitions (kind TEXT NOT NULL, id TEXT NOT NULL, data BLOB NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(kind,id))`,
 		`CREATE INDEX IF NOT EXISTS events_run_id_id ON events(run_id, id)`,
 	} {
 		if _, err := db.ExecContext(ctx, q); err != nil {
@@ -45,6 +46,29 @@ func Open(path string) (*SQLite, error) {
 		}
 	}
 	return s, nil
+}
+
+func (s *SQLite) SaveDefinition(kind, id string, data []byte) error {
+	_, err := s.db.Exec(`INSERT INTO definitions(kind,id,data,updated_at) VALUES(?,?,?,?) ON CONFLICT(kind,id) DO UPDATE SET data=excluded.data,updated_at=excluded.updated_at`, kind, id, data, time.Now().UTC().Format(time.RFC3339Nano))
+	return err
+}
+
+func (s *SQLite) Definitions(kind string) (map[string][]byte, error) {
+	rows, err := s.db.Query(`SELECT id,data FROM definitions WHERE kind=? ORDER BY id`, kind)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string][]byte{}
+	for rows.Next() {
+		var id string
+		var data []byte
+		if err := rows.Scan(&id, &data); err != nil {
+			return nil, err
+		}
+		out[id] = append([]byte(nil), data...)
+	}
+	return out, rows.Err()
 }
 
 func (s *SQLite) Close() error { return s.db.Close() }

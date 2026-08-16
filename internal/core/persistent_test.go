@@ -9,15 +9,15 @@ import (
 )
 
 func TestPersistentStoreReopensAndContinuesOrderedIDs(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "bench.db")
+	path := filepath.Join(t.TempDir(), "dispatch.db")
 	s, err := OpenStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.CreateRun(Run{ID: "run-1", Mode: "bench", Name: "reopen"}); err != nil {
+	if err := s.CreateRun(Run{ID: "run-1", Mode: "dispatch", Name: "reopen"}); err != nil {
 		t.Fatal(err)
 	}
-	e1, err := s.Append("run-1", "benchmark.started", map[string]any{"case": "one"})
+	e1, err := s.Append("run-1", "dispatchmark.started", map[string]any{"case": "one"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -37,7 +37,7 @@ func TestPersistentStoreReopensAndContinuesOrderedIDs(t *testing.T) {
 	if p.Status != "running" || p.Steps != 1 || p.LastEventID != e1.ID {
 		t.Fatalf("bad recovered projection: %#v", p)
 	}
-	e2, err := s.Append("run-1", "benchmark.completed", map[string]any{"score": 1})
+	e2, err := s.Append("run-1", "dispatchmark.completed", map[string]any{"score": 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,7 +56,7 @@ func TestPersistentStoreRejectsCorruptSequence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = s.CreateRun(Run{ID: "r", Mode: "bench"})
+	_ = s.CreateRun(Run{ID: "r", Mode: "dispatch"})
 	_, _ = s.Append("r", "run.started", map[string]any{})
 	_, _ = s.Append("r", "run.completed", map[string]any{})
 	s.Close()
@@ -117,20 +117,20 @@ func TestPersistentStoreRedactsBeforeSQLite(t *testing.T) {
 
 func TestSeparateDatabaseFilesDoNotShareModes(t *testing.T) {
 	dir := t.TempDir()
-	bench, err := OpenStore(filepath.Join(dir, "bench.db"))
+	primary, err := OpenStore(filepath.Join(dir, "dispatch.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := bench.CreateRun(Run{ID: "b", Mode: "bench"}); err != nil {
+	if err := primary.CreateRun(Run{ID: "b", Mode: "dispatch"}); err != nil {
 		t.Fatal(err)
 	}
-	bench.Close()
-	dispatch, err := OpenStore(filepath.Join(dir, "dispatch.db"))
+	primary.Close()
+	other, err := OpenStore(filepath.Join(dir, "other.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer dispatch.Close()
-	if _, ok := dispatch.GetRun("b"); ok {
+	defer other.Close()
+	if _, ok := other.GetRun("b"); ok {
 		t.Fatal("run leaked between mode databases")
 	}
 }

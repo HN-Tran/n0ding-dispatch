@@ -1,13 +1,13 @@
-.PHONY: test build run-bench run-dispatch
+.PHONY: test vet build run
 
 test:
 	go test ./...
 
 build:
-	go build -o bin/n0ding-lab ./cmd/n0ding-lab
+	go build -o bin/n0ding-dispatch ./cmd/n0ding-dispatch
 
-run-bench:
-	go run ./cmd/n0ding-lab -mode bench
+vet:
+	go vet ./...
 
-run-dispatch:
-	go run ./cmd/n0ding-lab -mode dispatch
+run:
+	go run ./cmd/n0ding-dispatch serve --db dispatch.db

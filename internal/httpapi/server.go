@@ -7,17 +7,26 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/hn-tran/n0ding-lab/internal/bundle"
-	"github.com/hn-tran/n0ding-lab/internal/core"
-	webassets "github.com/hn-tran/n0ding-lab/web"
+	"github.com/hn-tran/n0ding-dispatch/internal/adapters"
+	"github.com/hn-tran/n0ding-dispatch/internal/bundle"
+	"github.com/hn-tran/n0ding-dispatch/internal/core"
+	"github.com/hn-tran/n0ding-dispatch/internal/dispatch"
+	webassets "github.com/hn-tran/n0ding-dispatch/web"
 )
 
 type Server struct {
-	Mode  string
-	Store *core.Store
-	Token string
+	Mode        string
+	Store       *core.Store
+	Token       string
+	mu          sync.Mutex
+	catalogs    map[string]dispatch.Catalog
+	dags        map[string]dispatch.TaskDAG
+	controllers map[string]*dispatch.Controller
+	adapter     adapters.Adapter
+	mutations   []time.Time
 }
 
 const maxBodyBytes int64 = 1 << 20
@@ -28,17 +37,29 @@ func New(mode string, store *core.Store) http.Handler {
 }
 
 func NewAuthenticated(mode string, store *core.Store, token string) http.Handler {
-	s := &Server{Mode: mode, Store: store, Token: token}
+	s := &Server{Mode: mode, Store: store, Token: token, catalogs: map[string]dispatch.Catalog{}, dags: map[string]dispatch.TaskDAG{}, controllers: map[string]*dispatch.Controller{}, adapter: adapters.NewFixture(adapters.FixturePass)}
+	s.loadDefinitions()
+	s.recoverInterrupted()
 	m := http.NewServeMux()
 	m.HandleFunc("GET /healthz", s.health)
 	m.HandleFunc("GET /api/v1/runs", s.listRuns)
-	m.HandleFunc("POST /api/v1/runs", s.createRun)
 	m.HandleFunc("GET /api/v1/runs/{id}/events", s.events)
-	m.HandleFunc("POST /api/v1/runs/{id}/events", s.appendEvent)
 	m.HandleFunc("GET /api/v1/runs/{id}/projection", s.projection)
 	m.HandleFunc("POST /api/v1/fixtures", s.fixture)
 	m.HandleFunc("GET /api/v1/runs/{id}/export", s.exportRun)
 	m.HandleFunc("POST /api/v1/replay/import", s.importReplay)
+	m.HandleFunc("GET /api/v1/agents", s.listAgents)
+	m.HandleFunc("POST /api/v1/agents", s.putCatalog)
+	m.HandleFunc("GET /api/v1/tasks", s.listTasks)
+	m.HandleFunc("POST /api/v1/tasks", s.putDAG)
+	m.HandleFunc("POST /api/v1/dispatch/run", s.startDispatch)
+	m.HandleFunc("GET /api/v1/runs/{id}/decisions", s.decisions)
+	m.HandleFunc("GET /api/v1/runs/{id}/approvals", s.approvals)
+	m.HandleFunc("GET /api/v1/runs/{id}/artifacts", s.artifacts)
+	m.HandleFunc("GET /api/v1/runs/{id}/messages", s.messages)
+	m.HandleFunc("POST /api/v1/runs/{id}/controls/{action}", s.control)
+	m.HandleFunc("POST /api/v1/runs/{id}/approvals/{digest}/{decision}", s.approve)
+	m.HandleFunc("POST /api/v1/runs/{id}/reconcile", s.reconcile)
 	m.Handle("GET /", http.FileServer(http.FS(webassets.FS)))
 	return s.security(m)
 }
@@ -81,14 +102,47 @@ func (s *Server) security(next http.Handler) http.Handler {
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("X-Frame-Options", "DENY")
 		if s.Token != "" && strings.HasPrefix(r.URL.Path, "/api/") {
-			provided := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-			if subtle.ConstantTimeCompare([]byte(provided), []byte(s.Token)) != 1 {
+			authorization := r.Header.Get("Authorization")
+			if !strings.HasPrefix(authorization, "Bearer ") || subtle.ConstantTimeCompare([]byte(strings.TrimPrefix(authorization, "Bearer ")), []byte(s.Token)) != 1 {
 				write(w, http.StatusUnauthorized, map[string]string{"error": "authentication required"})
+				return
+			}
+		}
+		if r.Method != http.MethodGet && r.Method != http.MethodHead && strings.HasPrefix(r.URL.Path, "/api/") {
+			if strings.EqualFold(r.Header.Get("Sec-Fetch-Site"), "cross-site") {
+				write(w, http.StatusForbidden, map[string]string{"error": "cross-site mutation rejected"})
+				return
+			}
+			if origin := r.Header.Get("Origin"); origin != "" && origin != "http://"+r.Host && origin != "https://"+r.Host {
+				write(w, http.StatusForbidden, map[string]string{"error": "cross-origin mutation rejected"})
+				return
+			}
+			if !s.allowMutation() {
+				write(w, http.StatusTooManyRequests, map[string]string{"error": "mutation rate limit exceeded"})
 				return
 			}
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func (s *Server) allowMutation() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	cut := now.Add(-time.Minute)
+	keep := s.mutations[:0]
+	for _, t := range s.mutations {
+		if t.After(cut) {
+			keep = append(keep, t)
+		}
+	}
+	s.mutations = keep
+	if len(keep) >= 120 {
+		return false
+	}
+	s.mutations = append(s.mutations, now)
+	return true
 }
 
 func (s *Server) owns(id string) bool { run, ok := s.Store.GetRun(id); return ok && run.Mode == s.Mode }

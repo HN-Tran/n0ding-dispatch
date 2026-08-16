@@ -2,7 +2,7 @@
 
 ## Assets
 
-Secrets, prompts and tool output; benchmark integrity; routing and approval authority; event history; artifacts; user identity; host and external runtime access.
+Secrets, prompts and tool output; routing integrity; routing and approval authority; event history; artifacts; user identity; host and external runtime access.
 
 ## Trust boundaries
 

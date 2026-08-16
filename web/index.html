@@ -3,70 +3,72 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta name="description" content="Evidence-first inspection for n0ding Bench and Dispatch runs.">
-  <title>n0ding Lab</title>
+  <meta name="description" content="n0ding Dispatch — evidence-first agent routing and control.">
+  <title>n0ding Dispatch</title>
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-  <a class="skip" href="#workspace">Skip to run workspace</a>
+  <a class="skip" href="#main">Skip to control center</a>
   <header class="topbar">
-    <a class="brand" href="/" aria-label="n0ding Lab home"><span class="mark">n0</span>ding <span>/ lab</span></a>
-    <div class="top-status">
-      <span class="signal" id="connectionDot" aria-hidden="true"></span>
-      <span id="connectionText">Connecting</span>
-      <span class="state-pill" id="viewState">LIVE</span>
-    </div>
+    <a class="brand" href="/" aria-label="n0ding Dispatch home"><b>n0</b>ding <span>Dispatch</span></a>
+    <nav class="mode-switch" aria-label="View mode">
+      <button class="mode active" data-mode="live" aria-pressed="true">Live</button>
+      <button class="mode" data-mode="replay" aria-pressed="false">Replay</button>
+    </nav>
+    <div class="connection"><i id="connectionDot"></i><span id="connectionText">Connecting</span><button id="authButton" class="quiet">Authenticate</button></div>
   </header>
 
-  <main id="workspace">
-    <section class="intro">
-      <div>
-        <p class="eyebrow" id="modeEyebrow">RUN INSPECTION</p>
-        <h1 id="productTitle">See the run.<br><em>Trust the evidence.</em></h1>
-        <p id="productCopy">Every state shown here is derived from stored backend events. No invented agents, scores, or activity.</p>
-      </div>
-      <button class="primary" id="startFixture"><span>Run deterministic fixture</span><span aria-hidden="true">↗</span></button>
+  <main id="main">
+    <section class="hero">
+      <div><p class="eyebrow">AGENT OPERATIONS</p><h1>Every task.<br><em>Every decision.</em></h1><p>Routing, execution and intervention derived only from persisted backend events.</p></div>
+      <div class="hero-actions"><button id="refresh" class="secondary">Refresh</button><button id="startFixture" class="primary">Load verified fixture</button></div>
     </section>
+    <div id="notice" class="notice" role="status" aria-live="polite">Loading server state…</div>
 
-    <div class="notice" id="notice" role="status" aria-live="polite">Loading server state…</div>
-
-    <section class="layout">
-      <aside class="panel runs-panel" aria-labelledby="runsHeading">
-        <div class="panel-head"><div><p class="kicker">HISTORY</p><h2 id="runsHeading">Runs</h2></div><button class="icon-button" id="refresh" aria-label="Refresh runs">↻</button></div>
-        <div id="runs" class="run-list"><p class="empty">No runs loaded.</p></div>
+    <section class="shell">
+      <aside class="panel runs-panel">
+        <div class="panel-title"><div><span>OPERATIONS</span><h2>Runs</h2></div><span id="runCount" class="count">0</span></div>
+        <div id="runs" class="runs"><p class="empty">No runs loaded.</p></div>
       </aside>
 
-      <div class="main-column">
-        <section class="summary-grid" aria-label="Run summary">
-          <article class="metric"><span>Status</span><strong id="status">—</strong></article>
-          <article class="metric"><span>Events</span><strong id="steps">0</strong></article>
-          <article class="metric"><span>Last event</span><strong id="lastEvent">—</strong></article>
-          <article class="metric"><span>Created</span><strong id="created">—</strong></article>
+      <div class="workspace">
+        <section class="overview">
+          <article><span>Run status</span><strong id="status">—</strong></article>
+          <article><span>Tasks</span><strong id="taskMetric">0</strong></article>
+          <article><span>Agents online</span><strong id="agentMetric">0</strong></article>
+          <article><span>Pending approvals</span><strong id="approvalMetric">0</strong></article>
+          <article><span>Last event</span><strong id="lastMetric">—</strong></article>
         </section>
 
-        <section class="panel evidence" aria-labelledby="evidenceHeading">
-          <div class="panel-head">
-            <div><p class="kicker" id="evidenceKicker">EVIDENCE</p><h2 id="evidenceHeading">Select a run</h2></div>
-            <div class="mode-tabs" aria-label="Projection view">
-              <button class="tab active" data-view="latest" aria-pressed="true">Latest</button>
-              <button class="tab" data-view="replay" aria-pressed="false">Replay</button>
-            </div>
-          </div>
-          <div class="replay-controls" id="replayControls" hidden>
-            <label for="replayRange">Replay through event <output id="replayValue">0</output></label>
-            <input id="replayRange" type="range" min="0" max="0" value="0">
-          </div>
-          <div id="domainEvidence"><p class="empty">Choose a run to inspect its evidence.</p></div>
+        <section class="panel control-panel">
+          <div class="panel-title"><div><span>CONTROL PLANE</span><h2 id="runTitle">Select a run</h2></div><div class="control-strip"><button data-control="pause">Pause</button><button data-control="resume">Resume</button><button data-control="cancel">Cancel</button><button data-control="retry">Retry</button><button data-control="reassign">Reassign</button><button data-control="emergency-stop" class="danger">Emergency stop</button></div></div>
+          <p class="control-help" id="controlState">Controls emit requests. State changes only after a backend acknowledgement event.</p>
+          <div id="replayControl" class="replay-control" hidden><label for="replayRange">Events through <output id="replayValue">0</output></label><input id="replayRange" type="range" min="0" max="0" value="0"></div>
         </section>
 
-        <section class="panel" aria-labelledby="timelineHeading">
-          <div class="panel-head"><div><p class="kicker">APPEND-ONLY LOG</p><h2 id="timelineHeading">Event timeline</h2></div><span class="mono muted" id="runId">No run</span></div>
-          <div class="table-wrap"><table><thead><tr><th scope="col">#</th><th scope="col">Time</th><th scope="col">Event</th><th scope="col">Evidence</th></tr></thead><tbody id="timeline"><tr><td colspan="4" class="empty">No events.</td></tr></tbody></table></div>
+        <section class="panel">
+          <div class="panel-title"><div><span>PRIMARY VIEW</span><h2>Task ledger</h2></div><div class="legend"><i class="ok"></i> acknowledged <i class="pending"></i> requested <i class="bad"></i> failed / unknown</div></div>
+          <div class="table-wrap"><table><thead><tr><th>Task</th><th>Status</th><th>Agent</th><th>Attempt</th><th>Route reason</th><th>Last evidence</th></tr></thead><tbody id="tasks"><tr><td colspan="6" class="empty">Select a run.</td></tr></tbody></table></div>
         </section>
+
+        <div class="two-column">
+          <section class="panel"><div class="panel-title"><div><span>DEPENDENCIES</span><h2>Task DAG</h2></div></div><div id="dag" class="dag"><p class="empty">No dependency evidence.</p></div></section>
+          <section class="panel"><div class="panel-title"><div><span>WORKFORCE</span><h2>Agents</h2></div></div><div id="agents" class="agent-list"><p class="empty">No agent evidence.</p></div></section>
+        </div>
+
+        <section class="panel"><div class="panel-title"><div><span>ROUTER EVIDENCE</span><h2>Route decisions</h2></div></div><div id="routes" class="decision-list"><p class="empty">No route decisions.</p></div></section>
+
+        <div class="two-column">
+          <section class="panel"><div class="panel-title"><div><span>COLLABORATION</span><h2>Messages & artifacts</h2></div></div><div id="collaboration" class="feed"><p class="empty">No evidence.</p></div></section>
+          <section class="panel"><div class="panel-title"><div><span>HUMAN GATE</span><h2>Approvals</h2></div></div><div id="approvals" class="feed"><p class="empty">No approval evidence.</p></div></section>
+        </div>
+
+        <section class="panel"><div class="panel-title"><div><span>APPEND-ONLY EVIDENCE</span><h2>Event timeline</h2></div><button id="export" class="secondary">Export authenticated bundle</button></div><div class="table-wrap"><table><thead><tr><th>#</th><th>Time</th><th>Event</th><th>Evidence</th></tr></thead><tbody id="timeline"><tr><td colspan="4" class="empty">No events.</td></tr></tbody></table></div></section>
       </div>
     </section>
   </main>
-  <footer><span>n0ding Lab · private vertical prototype</span><span>Read-only replay never executes tools</span></footer>
+  <footer><span>n0ding Dispatch · local control center</span><span>Replay is read-only and never executes tools</span></footer>
+  <dialog id="authDialog"><form method="dialog"><h2>API authentication</h2><p>The bearer token stays in memory and is cleared when this page closes.</p><label>Bearer token<input id="tokenInput" type="password" autocomplete="off" spellcheck="false"></label><div><button value="cancel" class="secondary">Cancel</button><button id="saveToken" value="default" class="primary">Use token</button></div></form></dialog>
   <script src="/app.js" defer></script>
 </body>
 </html>

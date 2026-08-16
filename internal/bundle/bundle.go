@@ -7,7 +7,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/hn-tran/n0ding-lab/internal/core"
+	"github.com/hn-tran/n0ding-dispatch/internal/core"
 )
 
 const MaxBundleBytes = 8 << 20
@@ -24,6 +24,16 @@ type Bundle struct {
 
 func digest(v any) (string, error) {
 	b, err := json.Marshal(v)
+	if err != nil {
+		return "", err
+	}
+	// Normalize concrete structs and JSON-decoded maps to one representation so
+	// export and import hash the same semantic event payload.
+	var normalized any
+	if err := json.Unmarshal(b, &normalized); err != nil {
+		return "", err
+	}
+	b, err = json.Marshal(normalized)
 	if err != nil {
 		return "", err
 	}

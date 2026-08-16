@@ -13,31 +13,25 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hn-tran/n0ding-lab/internal/core"
+	"github.com/hn-tran/n0ding-dispatch/internal/core"
 )
 
 func TestRunLifecycleAndModeIsolation(t *testing.T) {
 	s := core.NewStore()
-	h := New("bench", s)
-	req := httptest.NewRequest("POST", "/api/v1/runs", strings.NewReader(`{"id":"one","name":"One"}`))
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-	h.ServeHTTP(w, req)
-	if w.Code != 201 {
-		t.Fatalf("create: %d %s", w.Code, w.Body.String())
+	h := New("dispatch", s)
+	if err := s.CreateRun(core.Run{ID: "one", Name: "One", Mode: "dispatch"}); err != nil {
+		t.Fatal(err)
 	}
-	ev := httptest.NewRequest("POST", "/api/v1/runs/one/events", strings.NewReader(`{"type":"benchmark.completed","data":{"password":"nope"}}`))
-	w = httptest.NewRecorder()
-	h.ServeHTTP(w, ev)
-	if w.Code != 201 || strings.Contains(w.Body.String(), "nope") {
-		t.Fatalf("append/redact: %d %s", w.Code, w.Body.String())
+	w := httptest.NewRecorder()
+	if _, err := s.Append("one", "dispatch.completed", map[string]any{"password": "nope"}); err != nil {
+		t.Fatal(err)
 	}
 	w = httptest.NewRecorder()
 	h.ServeHTTP(w, httptest.NewRequest("GET", "/api/v1/runs/one/projection", nil))
 	if !strings.Contains(w.Body.String(), `"status":"completed"`) {
 		t.Fatalf("projection: %s", w.Body.String())
 	}
-	_ = s.CreateRun(core.Run{ID: "other", Mode: "dispatch"})
+	_ = s.CreateRun(core.Run{ID: "other", Mode: "foreign"})
 	w = httptest.NewRecorder()
 	h.ServeHTTP(w, httptest.NewRequest("GET", "/api/v1/runs", nil))
 	if strings.Contains(w.Body.String(), "other") {
@@ -47,10 +41,10 @@ func TestRunLifecycleAndModeIsolation(t *testing.T) {
 
 func TestEventsResumeJSON(t *testing.T) {
 	s := core.NewStore()
-	_ = s.CreateRun(core.Run{ID: "r", Mode: "bench"})
+	_ = s.CreateRun(core.Run{ID: "r", Mode: "dispatch"})
 	a, _ := s.Append("r", "event.one", nil)
 	b, _ := s.Append("r", "event.two", nil)
-	h := New("bench", s)
+	h := New("dispatch", s)
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, httptest.NewRequest("GET", "/api/v1/runs/r/events?after="+json.Number(string(rune('0'+a.ID))).String(), nil))
 	var out struct {
@@ -66,10 +60,10 @@ func TestEventsResumeJSON(t *testing.T) {
 
 func TestSSEResumesFromLastEventID(t *testing.T) {
 	s := core.NewStore()
-	_ = s.CreateRun(core.Run{ID: "r", Mode: "bench"})
+	_ = s.CreateRun(core.Run{ID: "r", Mode: "dispatch"})
 	first, _ := s.Append("r", "event.one", nil)
 	second, _ := s.Append("r", "event.two", nil)
-	srv := httptest.NewServer(New("bench", s))
+	srv := httptest.NewServer(New("dispatch", s))
 	defer srv.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -102,8 +96,8 @@ func TestSSEResumesFromLastEventID(t *testing.T) {
 
 func TestAuthModeIsolationAndCursorValidation(t *testing.T) {
 	s := core.NewStore()
-	_ = s.CreateRun(core.Run{ID: "dispatch-only", Mode: "dispatch"})
-	h := NewAuthenticated("bench", s, "secret")
+	_ = s.CreateRun(core.Run{ID: "dispatch-only", Mode: "foreign"})
+	h := NewAuthenticated("dispatch", s, "secret")
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, httptest.NewRequest("GET", "/api/v1/runs", nil))
 	if w.Code != http.StatusUnauthorized {
@@ -116,8 +110,8 @@ func TestAuthModeIsolationAndCursorValidation(t *testing.T) {
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("cross-mode access: %d %s", w.Code, w.Body.String())
 	}
-	_ = s.CreateRun(core.Run{ID: "bench-only", Mode: "bench"})
-	req = httptest.NewRequest("GET", "/api/v1/runs/bench-only/events?after=-1", nil)
+	_ = s.CreateRun(core.Run{ID: "other-only", Mode: "dispatch"})
+	req = httptest.NewRequest("GET", "/api/v1/runs/other-only/events?after=-1", nil)
 	req.Header.Set("Authorization", "Bearer secret")
 	w = httptest.NewRecorder()
 	h.ServeHTTP(w, req)
@@ -128,17 +122,12 @@ func TestAuthModeIsolationAndCursorValidation(t *testing.T) {
 
 func TestSecretAbsentFromAPIAndExport(t *testing.T) {
 	s := core.NewStore()
-	h := New("bench", s)
+	h := New("dispatch", s)
 	w := httptest.NewRecorder()
-	h.ServeHTTP(w, httptest.NewRequest("POST", "/api/v1/runs", strings.NewReader(`{"ID":"safe","Name":"sentinel-supersecret"}`)))
-	if w.Code != http.StatusCreated {
-		t.Fatalf("create %d %s", w.Code, w.Body.String())
+	if err := s.CreateRun(core.Run{ID: "safe", Name: "sentinel-supersecret", Mode: "dispatch"}); err != nil {
+		t.Fatal(err)
 	}
-	w = httptest.NewRecorder()
-	h.ServeHTTP(w, httptest.NewRequest("POST", "/api/v1/runs/safe/events", strings.NewReader(`{"type":"run.started","data":{"message":"sentinel-supersecret","api_key":"sentinel-supersecret"}}`)))
-	if strings.Contains(w.Body.String(), "sentinel-supersecret") {
-		t.Fatal("secret in append response")
-	}
+	_, _ = s.Append("safe", "dispatch.started", map[string]any{"message": "sentinel-supersecret", "api_key": "sentinel-supersecret"})
 	for _, path := range []string{"/api/v1/runs/safe/events", "/api/v1/runs/safe/export"} {
 		w = httptest.NewRecorder()
 		h.ServeHTTP(w, httptest.NewRequest("GET", path, nil))
@@ -150,12 +139,12 @@ func TestSecretAbsentFromAPIAndExport(t *testing.T) {
 
 func TestEventBacklogIsBounded(t *testing.T) {
 	s := core.NewStore()
-	_ = s.CreateRun(core.Run{ID: "r", Mode: "bench"})
+	_ = s.CreateRun(core.Run{ID: "r", Mode: "dispatch"})
 	for i := 0; i < maxSSEBacklog+1; i++ {
-		_, _ = s.Append("r", "case.completed", map[string]any{"n": i})
+		_, _ = s.Append("r", "task.completed", map[string]any{"n": i})
 	}
 	w := httptest.NewRecorder()
-	New("bench", s).ServeHTTP(w, httptest.NewRequest("GET", "/api/v1/runs/r/events", nil))
+	New("dispatch", s).ServeHTTP(w, httptest.NewRequest("GET", "/api/v1/runs/r/events", nil))
 	if w.Code != http.StatusConflict {
 		t.Fatalf("unbounded backlog returned: %d", w.Code)
 	}

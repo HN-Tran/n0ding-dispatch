@@ -8,7 +8,7 @@ import (
 
 func TestEventJSONMatchesCanonicalEnvelope(t *testing.T) {
 	s := NewStore()
-	_ = s.CreateRun(Run{ID: "r", Mode: "bench"})
+	_ = s.CreateRun(Run{ID: "r", Mode: "dispatch"})
 	e, _ := s.Append("r", "run.started", map[string]any{"x": 1})
 	raw, _ := json.Marshal(e)
 	var v map[string]any
@@ -54,9 +54,9 @@ func TestRedactionBeforeStorage(t *testing.T) {
 
 func TestReplayAtEvent(t *testing.T) {
 	s := NewStore()
-	_ = s.CreateRun(Run{ID: "r", Mode: "bench"})
-	e1, _ := s.Append("r", "benchmark.started", nil)
-	_, _ = s.Append("r", "benchmark.completed", nil)
+	_ = s.CreateRun(Run{ID: "r", Mode: "dispatch"})
+	e1, _ := s.Append("r", "dispatchmark.started", nil)
+	_, _ = s.Append("r", "dispatchmark.completed", nil)
 	p, err := s.Replay("r", e1.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -71,7 +71,7 @@ func TestReplayAtEvent(t *testing.T) {
 }
 
 func TestFixturesDeterministicAndIndependent(t *testing.T) {
-	for _, mode := range []string{"bench", "dispatch"} {
+	for _, mode := range []string{"dispatch"} {
 		s := NewStore()
 		r, err := LoadFixture(s, mode)
 		if err != nil {

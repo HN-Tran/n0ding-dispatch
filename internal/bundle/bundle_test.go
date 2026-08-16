@@ -2,14 +2,14 @@ package bundle
 
 import (
 	"encoding/json"
-	"github.com/hn-tran/n0ding-lab/internal/core"
+	"github.com/hn-tran/n0ding-dispatch/internal/core"
 	"testing"
 )
 
 func TestExportVerifyReplayAndTamper(t *testing.T) {
 	s := core.NewStore()
-	core.LoadFixture(s, "bench")
-	raw, err := Export(s, "bench-fixture")
+	core.LoadFixture(s, "dispatch")
+	raw, err := Export(s, "dispatch-fixture")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -29,8 +29,8 @@ func TestExportVerifyReplayAndTamper(t *testing.T) {
 
 func TestSequenceGapRejectedEvenWithUpdatedChecksum(t *testing.T) {
 	s := core.NewStore()
-	core.LoadFixture(s, "bench")
-	raw, _ := Export(s, "bench-fixture")
+	core.LoadFixture(s, "dispatch")
+	raw, _ := Export(s, "dispatch-fixture")
 	var b Bundle
 	if err := json.Unmarshal(raw, &b); err != nil {
 		t.Fatal(err)
