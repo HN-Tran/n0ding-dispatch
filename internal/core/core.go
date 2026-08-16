@@ -279,6 +279,8 @@ func nextStatus(current, typ string) string {
 	switch {
 	case strings.HasSuffix(typ, ".started"):
 		return "running"
+	case typ == "dispatch.resumed":
+		return "running"
 	case strings.HasSuffix(typ, ".completed"):
 		return "completed"
 	case strings.HasSuffix(typ, ".failed"):
@@ -358,6 +360,8 @@ func (s *Store) Replay(runID string, upto int64) (Projection, error) {
 		p.LastEventID = e.ID
 		switch {
 		case e.Type == "dispatch.started":
+			p.Status = "running"
+		case e.Type == "dispatch.resumed":
 			p.Status = "running"
 		case e.Type == "dispatch.completed":
 			p.Status = "completed"

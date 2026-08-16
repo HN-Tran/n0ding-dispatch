@@ -54,11 +54,11 @@ func TestControlAndReconcileSendSafetyFields(t *testing.T) {
 	if got := run(base); got != exitUsage {
 		t.Fatalf("missing evidence=%d", got)
 	}
-	if got := run(append(base, "--evidence", "operator-check-42")); got != exitOK {
+	if got := run(append(base, "--evidence", "operator-check-42", "--disposition", "not_applied")); got != exitOK {
 		t.Fatalf("reconcile=%d", got)
 	}
 	reconcile := <-requests
-	if reconcile.path != "/api/v1/runs/r/reconcile" || reconcile.body["evidence"] != "operator-check-42" {
+	if reconcile.path != "/api/v1/runs/r/reconcile" || reconcile.body["evidence"] != "operator-check-42" || reconcile.body["disposition"] != "not_applied" {
 		t.Fatalf("reconcile request=%+v", reconcile)
 	}
 }

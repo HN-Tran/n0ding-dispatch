@@ -68,6 +68,7 @@ const (
 	CommandFailed         CommandState = "failed"
 	CommandOutcomeUnknown CommandState = "outcome_unknown"
 	CommandReconciled     CommandState = "reconciled"
+	CommandCancelled      CommandState = "cancelled"
 )
 
 type Command struct {
@@ -124,26 +125,30 @@ func NewBoundedController(max int) *Controller {
 }
 
 func (c *Controller) Request(cmd Command, now time.Time) (Command, error) {
+	result, _, err := c.RequestOnce(cmd, now)
+	return result, err
+}
+func (c *Controller) RequestOnce(cmd Command, now time.Time) (Command, bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.stopped {
-		return Command{}, errors.New("emergency stop active")
+		return Command{}, false, errors.New("emergency stop active")
 	}
 	if cmd.ID == "" || cmd.IdempotencyKey == "" || cmd.TaskID == "" {
-		return Command{}, errors.New("command id, task and idempotency key required")
+		return Command{}, false, errors.New("command id, task and idempotency key required")
 	}
 	if old, ok := c.commands[cmd.IdempotencyKey]; ok {
-		return old, nil
+		return old, false, nil
 	}
 	if c.commandCount >= c.maxCommands {
-		return Command{}, errors.New("runaway command bound reached")
+		return Command{}, false, errors.New("runaway command bound reached")
 	}
 	cmd.State = CommandRequested
 	cmd.RequestedAt = now
 	cmd.UpdatedAt = now
 	c.commands[cmd.IdempotencyKey] = cmd
 	c.commandCount++
-	return cmd, nil
+	return cmd, true, nil
 }
 func (c *Controller) Transition(key string, to CommandState, result, errText string, now time.Time) (Command, error) {
 	c.mu.Lock()
@@ -152,7 +157,7 @@ func (c *Controller) Transition(key string, to CommandState, result, errText str
 	if !ok {
 		return Command{}, errors.New("unknown command")
 	}
-	allowed := map[CommandState]map[CommandState]bool{CommandRequested: {CommandAcknowledged: true, CommandFailed: true}, CommandAcknowledged: {CommandCompleted: true, CommandFailed: true, CommandOutcomeUnknown: true}, CommandOutcomeUnknown: {CommandReconciled: true}}
+	allowed := map[CommandState]map[CommandState]bool{CommandRequested: {CommandAcknowledged: true, CommandFailed: true, CommandCancelled: true}, CommandAcknowledged: {CommandCompleted: true, CommandFailed: true, CommandOutcomeUnknown: true, CommandCancelled: true}, CommandOutcomeUnknown: {CommandReconciled: true}}
 	if !allowed[cmd.State][to] {
 		return Command{}, errors.New("invalid command transition")
 	}
@@ -174,6 +179,19 @@ func (c *Controller) Command(key string) (Command, bool) {
 	defer c.mu.Unlock()
 	v, ok := c.commands[key]
 	return v, ok
+}
+func (c *Controller) RotateFenceForCommand(key, task string) (Command, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	cmd, ok := c.commands[key]
+	if !ok || cmd.TaskID != task {
+		return Command{}, errors.New("unknown command")
+	}
+	c.fences[task]++
+	cmd.Fence = c.fences[task]
+	cmd.UpdatedAt = time.Now()
+	c.commands[key] = cmd
+	return cmd, nil
 }
 
 func (c *Controller) SnapshotCommands() []Command {

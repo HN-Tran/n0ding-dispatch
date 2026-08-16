@@ -18,17 +18,18 @@ import (
 )
 
 type Server struct {
-	Mode        string
-	Store       *core.Store
-	Token       string
-	mu          sync.Mutex
-	catalogs    map[string]dispatch.Catalog
-	dags        map[string]dispatch.TaskDAG
-	controllers map[string]*dispatch.Controller
-	adapters    map[string]adapters.Adapter
-	runTimeouts map[string]time.Duration
-	openclaw    adapters.Adapter
-	mutations   []time.Time
+	Mode           string
+	Store          *core.Store
+	Token          string
+	mu             sync.Mutex
+	catalogs       map[string]dispatch.Catalog
+	dags           map[string]dispatch.TaskDAG
+	controllers    map[string]*dispatch.Controller
+	adapters       map[string]adapters.Adapter
+	runTimeouts    map[string]time.Duration
+	approvalClaims map[string]bool
+	openclaw       adapters.Adapter
+	mutations      []time.Time
 }
 
 const maxBodyBytes int64 = 1 << 20
@@ -57,7 +58,7 @@ func NewConfigured(mode string, store *core.Store, token, openclawEndpoint, open
 			return nil, err
 		}
 	}
-	s := &Server{Mode: mode, Store: store, Token: token, catalogs: map[string]dispatch.Catalog{}, dags: map[string]dispatch.TaskDAG{}, controllers: map[string]*dispatch.Controller{}, adapters: map[string]adapters.Adapter{}, runTimeouts: map[string]time.Duration{}, openclaw: openclaw}
+	s := &Server{Mode: mode, Store: store, Token: token, catalogs: map[string]dispatch.Catalog{}, dags: map[string]dispatch.TaskDAG{}, controllers: map[string]*dispatch.Controller{}, adapters: map[string]adapters.Adapter{}, runTimeouts: map[string]time.Duration{}, approvalClaims: map[string]bool{}, openclaw: openclaw}
 	s.loadDefinitions()
 	s.recoverControllers()
 	s.recoverAdapters()

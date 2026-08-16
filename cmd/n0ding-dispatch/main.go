@@ -85,6 +85,7 @@ func run(args []string) int {
 		task := fs.String("task", "", "")
 		key := fs.String("idempotency-key", "", "")
 		fence := fs.Uint64("fencing-token", 0, "")
+		agent := fs.String("agent", "", "")
 		if fs.Parse(args[1:]) != nil || *runID == "" || fs.NArg() != 1 {
 			return bad(exitUsage, "control requires --run RUN [--task TASK] [--fencing-token TOKEN] ACTION")
 		}
@@ -92,7 +93,10 @@ func run(args []string) int {
 		if action != "emergency-stop" && *fence == 0 {
 			return bad(exitUsage, "control action requires a non-zero --fencing-token")
 		}
-		return request("POST", fmt.Sprintf("%s/api/v1/runs/%s/controls/%s", *base, *runID, action), *token, map[string]any{"task_id": *task, "idempotency_key": *key, "fencing_token": *fence}, os.Stdout)
+		if action == "reassign" && strings.TrimSpace(*agent) == "" {
+			return bad(exitUsage, "reassign requires --agent")
+		}
+		return request("POST", fmt.Sprintf("%s/api/v1/runs/%s/controls/%s", *base, *runID, action), *token, map[string]any{"task_id": *task, "idempotency_key": *key, "fencing_token": *fence, "agent": *agent}, os.Stdout)
 	case "approve":
 		fs, base, token := remoteFlags("approve")
 		runID := fs.String("run", "", "")
@@ -108,10 +112,11 @@ func run(args []string) int {
 		key := fs.String("idempotency-key", "", "")
 		result := fs.String("result", "", "")
 		evidence := fs.String("evidence", "", "")
-		if fs.Parse(args[1:]) != nil || *runID == "" || *key == "" || strings.TrimSpace(*result) == "" || strings.TrimSpace(*evidence) == "" {
-			return bad(exitUsage, "reconcile requires --run, --idempotency-key, --result and --evidence")
+		disposition := fs.String("disposition", "", "")
+		if fs.Parse(args[1:]) != nil || *runID == "" || *key == "" || strings.TrimSpace(*result) == "" || strings.TrimSpace(*evidence) == "" || (*disposition != "applied" && *disposition != "not_applied" && *disposition != "still_unknown") {
+			return bad(exitUsage, "reconcile requires --run, --idempotency-key, --result, --evidence and --disposition")
 		}
-		return request("POST", fmt.Sprintf("%s/api/v1/runs/%s/reconcile", *base, *runID), *token, map[string]any{"idempotency_key": *key, "result": *result, "evidence": *evidence}, os.Stdout)
+		return request("POST", fmt.Sprintf("%s/api/v1/runs/%s/reconcile", *base, *runID), *token, map[string]any{"idempotency_key": *key, "result": *result, "evidence": *evidence, "disposition": *disposition}, os.Stdout)
 	case "export":
 		fs, base, token := remoteFlags("export")
 		runID := fs.String("run", "", "")

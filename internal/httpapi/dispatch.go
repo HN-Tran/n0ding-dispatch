@@ -287,7 +287,7 @@ func (s *Server) scheduleRun(id string, catalog dispatch.Catalog, dag dispatch.T
 		if e.Type == "command.acknowledged" {
 			active[task] = true
 		}
-		if e.Type == "command.completed" || e.Type == "command.failed" || e.Type == "command.outcome_unknown" {
+		if e.Type == "command.completed" || e.Type == "command.cancelled" || e.Type == "command.failed" || e.Type == "command.outcome_unknown" {
 			active[task] = false
 		}
 		if e.Type == "approval.requested" {
@@ -349,11 +349,18 @@ func (s *Server) dispatchTask(id string, task dispatch.Task, agent string) error
 	if _, ok := ctrl.Command(key); ok {
 		return nil
 	}
-	fence := ctrl.RenewLease(task.ID)
-	cmd, err := ctrl.Request(dispatch.Command{ID: key, IdempotencyKey: key, TaskID: task.ID, Fence: fence}, time.Now())
+	cmd, created, err := ctrl.RequestOnce(dispatch.Command{ID: key, IdempotencyKey: key, TaskID: task.ID}, time.Now())
 	if err != nil {
 		return err
 	}
+	if !created {
+		return nil
+	}
+	cmd, err = ctrl.RotateFenceForCommand(key, task.ID)
+	if err != nil {
+		return err
+	}
+	fence := cmd.Fence
 	_, _ = s.Store.Append(id, "command.requested", commandData(cmd, "dispatch"))
 	ctx, cancel := context.WithTimeout(context.Background(), s.timeoutFor(id))
 	ack, err := adapter.Dispatch(ctx, adapters.DispatchRequest{TaskID: task.ID, Agent: agent, IdempotencyKey: key, FencingToken: fence})
@@ -454,6 +461,10 @@ func (s *Server) control(w http.ResponseWriter, r *http.Request) {
 	if in.IdempotencyKey == "" {
 		in.IdempotencyKey = fmt.Sprintf("%s:%s:%s", id, in.TaskID, action)
 	}
+	if action == "reassign" && strings.TrimSpace(in.Agent) == "" {
+		write(w, 422, map[string]string{"error": "reassign requires target agent"})
+		return
+	}
 	eventName := map[string]string{"pause": "task.paused", "resume": "task.resumed", "cancel": "task.cancelled", "retry": "task.retried", "reassign": "task.reassigned"}[action]
 	s.mu.Lock()
 	ctrl := s.controllers[id]
@@ -463,6 +474,14 @@ func (s *Server) control(w http.ResponseWriter, r *http.Request) {
 		s.controllers[id] = ctrl
 	}
 	s.mu.Unlock()
+	if action == "retry" {
+		for _, candidate := range ctrl.SnapshotCommands() {
+			if candidate.TaskID == in.TaskID && candidate.State == dispatch.CommandOutcomeUnknown {
+				write(w, 409, map[string]string{"error": "retry forbidden while outcome is unknown; reconcile first"})
+				return
+			}
+		}
+	}
 	if old, ok := ctrl.Command(in.IdempotencyKey); ok {
 		write(w, http.StatusOK, old)
 		return
@@ -481,14 +500,22 @@ func (s *Server) control(w http.ResponseWriter, r *http.Request) {
 		write(w, http.StatusConflict, map[string]string{"error": "run adapter is unavailable after restart; reconcile before controlling"})
 		return
 	}
-	cmd, err := ctrl.Request(dispatch.Command{ID: in.IdempotencyKey, IdempotencyKey: in.IdempotencyKey, TaskID: defaultString(in.TaskID, "run"), Fence: in.FencingToken}, time.Now())
+	cmd, created, err := ctrl.RequestOnce(dispatch.Command{ID: in.IdempotencyKey, IdempotencyKey: in.IdempotencyKey, TaskID: defaultString(in.TaskID, "run"), Fence: in.FencingToken}, time.Now())
 	if err != nil {
 		write(w, 409, map[string]string{"error": err.Error()})
 		return
 	}
-	if cmd.State != dispatch.CommandRequested {
+	if !created {
 		write(w, http.StatusOK, cmd)
 		return
+	}
+	if action == "resume" || action == "retry" || action == "reassign" {
+		cmd, err = ctrl.RotateFenceForCommand(in.IdempotencyKey, in.TaskID)
+		if err != nil {
+			write(w, 409, map[string]string{"error": err.Error()})
+			return
+		}
+		in.FencingToken = cmd.Fence
 	}
 	_, _ = s.Store.Append(id, "control.requested", commandData(cmd, action))
 	if action == "emergency-stop" {
@@ -536,6 +563,20 @@ func (s *Server) control(w http.ResponseWriter, r *http.Request) {
 	cmd, _ = ctrl.Transition(in.IdempotencyKey, dispatch.CommandAcknowledged, "accepted", "", time.Now())
 	_, _ = s.Store.Append(id, "control.acknowledged", commandData(cmd, action))
 	_, _ = s.Store.Append(id, eventName, map[string]any{"task_id": in.TaskID, "agent_id": in.Agent, "accepted": ack.Accepted})
+	if action == "retry" {
+		_, _ = s.Store.Append(id, "dispatch.resumed", map[string]any{"reason": "safe_retry", "task_id": in.TaskID})
+		retryKey := id + ":" + in.TaskID + ":dispatch:retry:" + in.IdempotencyKey
+		retryCmd, created, retryErr := ctrl.RequestOnce(dispatch.Command{ID: retryKey, IdempotencyKey: retryKey, TaskID: in.TaskID, Fence: in.FencingToken}, time.Now())
+		if retryErr != nil {
+			write(w, 409, map[string]string{"error": retryErr.Error()})
+			return
+		}
+		if created {
+			_, _ = s.Store.Append(id, "command.requested", commandData(retryCmd, "dispatch_retry"))
+			retryCmd, _ = ctrl.Transition(retryKey, dispatch.CommandAcknowledged, "", "", time.Now())
+			_, _ = s.Store.Append(id, "command.acknowledged", commandData(retryCmd, "dispatch_retry"))
+		}
+	}
 	write(w, 202, cmd)
 }
 
@@ -624,14 +665,27 @@ func (s *Server) approve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	claim := id + ":" + digest
+	s.mu.Lock()
+	if s.approvalClaims[claim] {
+		s.mu.Unlock()
+		write(w, http.StatusConflict, map[string]any{"error": "approval decision is already in progress", "action_digest": digest})
+		return
+	}
+	s.approvalClaims[claim] = true
+	s.mu.Unlock()
 	_, err = s.Store.Append(id, "approval."+map[string]string{"grant": "granted", "deny": "denied"}[decision], map[string]any{"action_digest": digest, "actor": in.Actor, "scope": scope, "request_event_id": requested.ID})
 	if err != nil {
+		s.mu.Lock()
+		delete(s.approvalClaims, claim)
+		s.mu.Unlock()
 		write(w, 500, map[string]string{"error": err.Error()})
 		return
 	}
 	if decision == "deny" {
 		_, _ = s.Store.Append(id, "dispatch.failed", map[string]any{"outcome": "approval_denied", "task_id": taskID, "action_digest": digest})
 	} else if taskID != "" {
+		_, _ = s.Store.Append(id, "dispatch.resumed", map[string]any{"reason": "approval_granted", "task_id": taskID})
 		catalog, dag, ok := s.runDefinitions(id)
 		if !ok {
 			write(w, 409, map[string]string{"error": "run definitions unavailable"})
@@ -674,6 +728,12 @@ func (s *Server) taskResult(w http.ResponseWriter, r *http.Request) {
 	}
 	key := id + ":" + taskID + ":dispatch"
 	cmd, ok := ctrl.Command(key)
+	for _, candidate := range ctrl.SnapshotCommands() {
+		if candidate.TaskID == taskID && candidate.State == dispatch.CommandAcknowledged && (!ok || candidate.UpdatedAt.After(cmd.UpdatedAt)) {
+			cmd, ok = candidate, true
+			key = candidate.IdempotencyKey
+		}
+	}
 	if !ok || cmd.State != dispatch.CommandAcknowledged {
 		write(w, 409, map[string]string{"error": "task is not awaiting a result"})
 		return
@@ -702,8 +762,8 @@ func (s *Server) taskResult(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if result.State == "cancelled" {
-		cmd, _ = ctrl.Transition(key, dispatch.CommandCompleted, "cancelled", "", time.Now())
-		_, _ = s.Store.Append(id, "command.completed", commandData(cmd, "dispatch"))
+		cmd, _ = ctrl.Transition(key, dispatch.CommandCancelled, "cancelled", "", time.Now())
+		_, _ = s.Store.Append(id, "command.cancelled", commandData(cmd, "dispatch"))
 		_, _ = s.Store.Append(id, "task.cancelled", map[string]any{"task_id": taskID, "result": result})
 		_, _ = s.Store.Append(id, "dispatch.cancelled", map[string]any{"outcome": "cancelled"})
 		write(w, 200, result)
@@ -756,9 +816,10 @@ func (s *Server) reconcile(w http.ResponseWriter, r *http.Request) {
 		IdempotencyKey string `json:"idempotency_key"`
 		Result         string `json:"result"`
 		Evidence       string `json:"evidence"`
+		Disposition    string `json:"disposition"`
 	}
-	if err := decodeBounded(w, r, &in); err != nil || in.IdempotencyKey == "" || strings.TrimSpace(in.Result) == "" || strings.TrimSpace(in.Evidence) == "" {
-		write(w, 400, map[string]string{"error": "idempotency_key, result and new evidence required"})
+	if err := decodeBounded(w, r, &in); err != nil || in.IdempotencyKey == "" || strings.TrimSpace(in.Result) == "" || strings.TrimSpace(in.Evidence) == "" || (in.Disposition != "applied" && in.Disposition != "not_applied" && in.Disposition != "still_unknown") {
+		write(w, 400, map[string]string{"error": "idempotency_key, result, evidence and disposition (applied|not_applied|still_unknown) required"})
 		return
 	}
 	s.mu.Lock()
@@ -773,9 +834,14 @@ func (s *Server) reconcile(w http.ResponseWriter, r *http.Request) {
 		write(w, 409, map[string]string{"error": "command is not awaiting reconciliation"})
 		return
 	}
-	req, err := s.Store.Append(id, "reconciliation.requested", map[string]any{"idempotency_key": in.IdempotencyKey, "command_id": cmd.ID, "evidence": in.Evidence})
+	req, err := s.Store.Append(id, "reconciliation.requested", map[string]any{"idempotency_key": in.IdempotencyKey, "command_id": cmd.ID, "evidence": in.Evidence, "disposition": in.Disposition})
 	if err != nil {
 		write(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	if in.Disposition == "still_unknown" {
+		_, _ = s.Store.Append(id, "reconciliation.still_unknown", map[string]any{"idempotency_key": in.IdempotencyKey, "command_id": cmd.ID, "result": in.Result, "evidence": in.Evidence, "request_event_id": req.ID})
+		write(w, 202, map[string]any{"reconciled": false, "disposition": in.Disposition, "command": cmd})
 		return
 	}
 	cmd, err = ctrl.Reconcile(in.IdempotencyKey, in.Result, time.Now())
@@ -783,7 +849,15 @@ func (s *Server) reconcile(w http.ResponseWriter, r *http.Request) {
 		write(w, 409, map[string]string{"error": err.Error()})
 		return
 	}
-	_, _ = s.Store.Append(id, "reconciliation.completed", map[string]any{"idempotency_key": in.IdempotencyKey, "command_id": cmd.ID, "result": in.Result, "evidence": in.Evidence, "request_event_id": req.ID})
+	_, _ = s.Store.Append(id, "reconciliation.completed", map[string]any{"idempotency_key": in.IdempotencyKey, "command_id": cmd.ID, "result": in.Result, "evidence": in.Evidence, "disposition": in.Disposition, "request_event_id": req.ID})
+	if in.Disposition == "applied" {
+		_, _ = s.Store.Append(id, "task.completed", map[string]any{"task_id": cmd.TaskID, "reconciled": true, "result": in.Result})
+		if catalog, dag, ok := s.runDefinitions(id); ok {
+			_ = s.scheduleRun(id, catalog, dag)
+		}
+	} else {
+		_, _ = s.Store.Append(id, "task.retry_allowed", map[string]any{"task_id": cmd.TaskID, "reason": "reconciled_not_applied", "fencing_token": cmd.Fence})
+	}
 	pending, failed := false, false
 	for _, candidate := range ctrl.SnapshotCommands() {
 		if candidate.State == dispatch.CommandOutcomeUnknown {
@@ -796,11 +870,30 @@ func (s *Server) reconcile(w http.ResponseWriter, r *http.Request) {
 	if !pending {
 		if failed {
 			_, _ = s.Store.Append(id, "dispatch.failed", map[string]any{"outcome": "reconciled_with_failures"})
-		} else {
-			_, _ = s.Store.Append(id, "dispatch.completed", map[string]any{"outcome": "reconciled"})
+		} else if in.Disposition == "applied" && s.allTasksCompleted(id) {
+			_, _ = s.Store.Append(id, "dispatch.completed", map[string]any{"outcome": "reconciled_applied"})
 		}
 	}
 	write(w, 202, map[string]any{"reconciled": true, "command": cmd})
+}
+
+func (s *Server) allTasksCompleted(id string) bool {
+	_, dag, ok := s.runDefinitions(id)
+	if !ok {
+		return false
+	}
+	done := map[string]bool{}
+	for _, e := range s.Store.Events(id, 0) {
+		if e.Type == "task.completed" {
+			done[stringValue(e.Data["task_id"])] = true
+		}
+	}
+	for _, task := range dag.Tasks {
+		if !done[task.ID] {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Server) filtered(w http.ResponseWriter, r *http.Request, types ...string) {

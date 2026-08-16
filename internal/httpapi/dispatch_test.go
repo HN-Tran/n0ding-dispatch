@@ -353,9 +353,69 @@ func TestLostResponseRequiresReconciliation(t *testing.T) {
 	if !strings.Contains(string(raw), "command.outcome_unknown") || !strings.Contains(string(raw), "reconciliation_required") || strings.Contains(string(raw), "command.completed") {
 		t.Fatalf("unsafe unknown outcome: %s", raw)
 	}
-	w = call(t, h, "POST", "/api/v1/runs/unknown/reconcile", `{"idempotency_key":"unknown:task-1:dispatch","result":"observed-not-applied","evidence":"operator checked upstream request log entry 42"}`)
+	w = call(t, h, "POST", "/api/v1/runs/unknown/controls/retry", `{"task_id":"task-1","idempotency_key":"unsafe-retry","fencing_token":1}`)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("unresolved retry=%d %s", w.Code, w.Body.String())
+	}
+	w = call(t, h, "POST", "/api/v1/runs/unknown/reconcile", `{"idempotency_key":"unknown:task-1:dispatch","result":"observed-not-applied","evidence":"operator checked upstream request log entry 42","disposition":"not_applied"}`)
 	if w.Code != 202 {
 		t.Fatalf("reconcile: %d %s", w.Code, w.Body.String())
+	}
+	raw, _ = json.Marshal(s.Events("unknown", 0))
+	if !strings.Contains(string(raw), "task.retry_allowed") || strings.Contains(string(raw), "task.completed") {
+		t.Fatalf("not_applied semantics: %s", raw)
+	}
+}
+
+func TestAppliedReconciliationCompletesObservedTask(t *testing.T) {
+	s, _ := core.OpenStore(filepath.Join(t.TempDir(), "d.db"))
+	defer s.Close()
+	h := New("dispatch", s)
+	seedDefinitions(t, h)
+	_ = call(t, h, "POST", "/api/v1/dispatch/run", `{"id":"applied","catalog_id":"cat","dag_id":"dag","fixture_mode":"lost_response"}`)
+	w := call(t, h, "POST", "/api/v1/runs/applied/reconcile", `{"idempotency_key":"applied:task-1:dispatch","result":"verified upstream result","evidence":"runtime audit 42","disposition":"applied"}`)
+	if w.Code != 202 {
+		t.Fatalf("reconcile=%d %s", w.Code, w.Body.String())
+	}
+	p, _ := s.Replay("applied", 0)
+	if p.Status != "completed" {
+		t.Fatalf("status=%s", p.Status)
+	}
+}
+
+func TestStillUnknownReconciliationRemainsFailClosed(t *testing.T) {
+	s, _ := core.OpenStore(filepath.Join(t.TempDir(), "d.db"))
+	defer s.Close()
+	h := New("dispatch", s)
+	seedDefinitions(t, h)
+	_ = call(t, h, "POST", "/api/v1/dispatch/run", `{"id":"still","catalog_id":"cat","dag_id":"dag","fixture_mode":"lost_response"}`)
+	w := call(t, h, "POST", "/api/v1/runs/still/reconcile", `{"idempotency_key":"still:task-1:dispatch","result":"inconclusive","evidence":"runtime audit incomplete","disposition":"still_unknown"}`)
+	if w.Code != 202 || !strings.Contains(w.Body.String(), `"reconciled":false`) {
+		t.Fatalf("reconcile=%d %s", w.Code, w.Body.String())
+	}
+	w = call(t, h, "POST", "/api/v1/runs/still/controls/retry", `{"task_id":"task-1","idempotency_key":"blocked","fencing_token":1}`)
+	if w.Code != 409 {
+		t.Fatalf("retry=%d %s", w.Code, w.Body.String())
+	}
+}
+
+func TestResumeRotatesFenceAndReassignRequiresAgent(t *testing.T) {
+	s, _ := core.OpenStore(filepath.Join(t.TempDir(), "d.db"))
+	defer s.Close()
+	h := New("dispatch", s)
+	seedDefinitions(t, h)
+	_ = call(t, h, "POST", "/api/v1/dispatch/run", `{"id":"rotate","catalog_id":"cat","dag_id":"dag"}`)
+	w := call(t, h, "POST", "/api/v1/runs/rotate/controls/reassign", `{"task_id":"task-1","idempotency_key":"bad","fencing_token":1}`)
+	if w.Code != 422 {
+		t.Fatalf("missing agent=%d", w.Code)
+	}
+	w = call(t, h, "POST", "/api/v1/runs/rotate/controls/resume", `{"task_id":"task-1","idempotency_key":"resume","fencing_token":1}`)
+	if w.Code != 202 || !strings.Contains(w.Body.String(), `"fence":2`) {
+		t.Fatalf("resume=%d %s", w.Code, w.Body.String())
+	}
+	w = call(t, h, "POST", "/api/v1/runs/rotate/controls/pause", `{"task_id":"task-1","idempotency_key":"stale","fencing_token":1}`)
+	if w.Code != 409 {
+		t.Fatalf("stale fence=%d %s", w.Code, w.Body.String())
 	}
 }
 
