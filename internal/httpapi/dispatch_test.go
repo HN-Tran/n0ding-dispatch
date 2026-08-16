@@ -4,11 +4,14 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/hn-tran/n0ding-dispatch/internal/core"
+	"github.com/hn-tran/n0ding-dispatch/internal/dispatch"
 )
 
 func call(t *testing.T, h http.Handler, method, path, body string) *httptest.ResponseRecorder {
@@ -58,11 +61,11 @@ func TestDispatchPassPersistsAndControls(t *testing.T) {
 			t.Fatalf("missing %s", typ)
 		}
 	}
-	w = call(t, h, "POST", "/api/v1/runs/pass/controls/pause", `{"task_id":"task-1","idempotency_key":"pause-1"}`)
+	w = call(t, h, "POST", "/api/v1/runs/pass/controls/pause", `{"task_id":"task-1","idempotency_key":"pause-1","fencing_token":1}`)
 	if w.Code != 202 {
 		t.Fatalf("pause %d %s", w.Code, w.Body.String())
 	}
-	w = call(t, h, "POST", "/api/v1/runs/pass/controls/pause", `{"task_id":"task-1","idempotency_key":"pause-1"}`)
+	w = call(t, h, "POST", "/api/v1/runs/pass/controls/pause", `{"task_id":"task-1","idempotency_key":"pause-1","fencing_token":1}`)
 	if w.Code != 200 {
 		t.Fatalf("idempotent duplicate did not return prior result: %d", w.Code)
 	}
@@ -75,6 +78,59 @@ func TestDispatchPassPersistsAndControls(t *testing.T) {
 	defs, err := s.Definitions("catalog")
 	if err != nil || defs["cat"] == nil {
 		t.Fatalf("definition not durable: %v", err)
+	}
+	h = New("dispatch", s)
+	w = call(t, h, "POST", "/api/v1/runs/pass/controls/pause", `{"task_id":"task-1","idempotency_key":"pause-1"}`)
+	if w.Code != 200 {
+		t.Fatalf("persisted duplicate after restart=%d %s", w.Code, w.Body.String())
+	}
+}
+
+func TestApprovalBindsCanonicalActionExpiryScopeAndActor(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		mutate  bool
+		expired bool
+		actor   string
+		want    int
+	}{
+		{"valid", false, false, "owner", 202}, {"mutated", true, false, "owner", 403},
+		{"expired", false, true, "owner", 403}, {"unauthorized", false, false, "intruder", 403},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := core.NewStore()
+			_ = s.CreateRun(core.Run{ID: "approval", Mode: "dispatch"})
+			h := New("dispatch", s)
+			a := dispatch.Action{Tool: "release", Target: "prod", Arguments: map[string]string{"version": "1"}, PolicyVersion: "v1", Scope: "release"}
+			digest := dispatch.ActionDigest(a)
+			if tc.mutate {
+				a.Arguments["version"] = "2"
+			}
+			expires := time.Now().Add(time.Hour)
+			if tc.expired {
+				expires = time.Now().Add(-time.Hour)
+			}
+			_, _ = s.Append("approval", "approval.requested", map[string]any{"action": a, "action_digest": digest, "expires": expires.Format(time.RFC3339), "scope": "release", "authorized_actors": []string{"owner"}})
+			w := call(t, h, "POST", "/api/v1/runs/approval/approvals/"+digest+"/grant", `{"actor":"`+tc.actor+`"}`)
+			if w.Code != tc.want {
+				t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
+func TestTopologicalOrdersChainsWithEqualDependencyCounts(t *testing.T) {
+	tasks := []dispatch.Task{{ID: "d", DependsOn: []string{"c"}}, {ID: "b", DependsOn: []string{"a"}}, {ID: "c", DependsOn: []string{"b"}}, {ID: "a"}}
+	got, err := topological(tasks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids []string
+	for _, task := range got {
+		ids = append(ids, task.ID)
+	}
+	if strings.Join(ids, ",") != "a,b,c,d" {
+		t.Fatalf("order=%v", ids)
 	}
 }
 
@@ -94,10 +150,94 @@ func TestLostResponseRequiresReconciliation(t *testing.T) {
 	if !strings.Contains(string(raw), "command.outcome_unknown") || !strings.Contains(string(raw), "reconciliation_required") || strings.Contains(string(raw), "command.completed") {
 		t.Fatalf("unsafe unknown outcome: %s", raw)
 	}
-	w = call(t, h, "POST", "/api/v1/runs/unknown/reconcile", `{"idempotency_key":"unknown:task-1:dispatch","result":"observed-not-applied"}`)
+	w = call(t, h, "POST", "/api/v1/runs/unknown/reconcile", `{"idempotency_key":"unknown:task-1:dispatch","result":"observed-not-applied","evidence":"operator checked upstream request log entry 42"}`)
 	if w.Code != 202 {
 		t.Fatalf("reconcile: %d %s", w.Code, w.Body.String())
 	}
+}
+
+func TestOpenClawRunUsesHTTPAdapterAndDoesNotPersistToken(t *testing.T) {
+	const token = "openclaw-test-secret"
+	var hits int
+	gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		if r.URL.Path != "/api/v1/dispatch/dispatch" {
+			t.Fatalf("unexpected gateway path %q", r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer "+token {
+			t.Fatalf("authorization=%q", got)
+		}
+		var request map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		if request["task_id"] != "task-1" {
+			t.Fatalf("request=%v", request)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"task_id":"task-1","accepted":true}`))
+	}))
+	defer gateway.Close()
+	t.Setenv("N0DING_TEST_OPENCLAW_TOKEN", token)
+
+	db := filepath.Join(t.TempDir(), "dispatch.db")
+	s, err := core.OpenStore(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	h := New("dispatch", s)
+	seedDefinitions(t, h)
+	body := `{"id":"openclaw","catalog_id":"cat","dag_id":"dag","adapter":"openclaw","endpoint":` + quote(gateway.URL) + `,"token_env":"N0DING_TEST_OPENCLAW_TOKEN","fixture_mode":"not-a-mode"}`
+	w := call(t, h, "POST", "/api/v1/dispatch/run", body)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("run: %d %s", w.Code, w.Body.String())
+	}
+	if hits != 1 {
+		t.Fatalf("OpenClaw gateway hits=%d; fixture may have been used", hits)
+	}
+	events, _ := json.Marshal(s.Events("openclaw", 0))
+	if !strings.Contains(string(events), "task.delegated") || strings.Contains(string(events), token) {
+		t.Fatalf("events=%s", events)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	files, err := filepath.Glob(db + "*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range files {
+		raw, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(raw), token) {
+			t.Fatalf("OpenClaw token was persisted in %s", filepath.Base(name))
+		}
+	}
+}
+
+func TestUnknownAdapterFailsClosedBeforeCreatingRun(t *testing.T) {
+	s, err := core.OpenStore(filepath.Join(t.TempDir(), "dispatch.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	h := New("dispatch", s)
+	seedDefinitions(t, h)
+	w := call(t, h, "POST", "/api/v1/dispatch/run", `{"id":"bad","catalog_id":"cat","dag_id":"dag","adapter":"surprise"}`)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	if _, ok := s.GetRun("bad"); ok {
+		t.Fatal("unknown adapter created a run")
+	}
+}
+
+func quote(v string) string {
+	b, _ := json.Marshal(v)
+	return string(b)
 }
 
 func TestRestartMarksRunningDispatchInterrupted(t *testing.T) {

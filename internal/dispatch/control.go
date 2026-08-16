@@ -197,10 +197,30 @@ func (c *Controller) RestoreCommands(commands []Command) error {
 			return errors.New("duplicate persisted idempotency key")
 		}
 		c.commands[cmd.IdempotencyKey] = cmd
+		if cmd.Fence > c.fences[cmd.TaskID] {
+			c.fences[cmd.TaskID] = cmd.Fence
+		}
+		if cmd.State == CommandCompleted || cmd.State == CommandReconciled {
+			c.results[cmd.IdempotencyKey] = cmd.Result
+		}
 		c.commandCount++
 	}
 	if c.commandCount > c.maxCommands {
 		return errors.New("persisted commands exceed bound")
+	}
+	return nil
+}
+
+// RestoreFence raises the current fencing token. It never moves a fence
+// backwards, which makes replaying persisted events safe and idempotent.
+func (c *Controller) RestoreFence(task string, token uint64) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if task == "" || token == 0 {
+		return errors.New("task and non-zero fencing token required")
+	}
+	if token > c.fences[task] {
+		c.fences[task] = token
 	}
 	return nil
 }

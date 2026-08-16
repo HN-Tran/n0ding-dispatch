@@ -55,8 +55,8 @@ func TestRedactionBeforeStorage(t *testing.T) {
 func TestReplayAtEvent(t *testing.T) {
 	s := NewStore()
 	_ = s.CreateRun(Run{ID: "r", Mode: "dispatch"})
-	e1, _ := s.Append("r", "dispatchmark.started", nil)
-	_, _ = s.Append("r", "dispatchmark.completed", nil)
+	e1, _ := s.Append("r", "dispatch.started", nil)
+	_, _ = s.Append("r", "dispatch.completed", nil)
 	p, err := s.Replay("r", e1.ID)
 	if err != nil {
 		t.Fatal(err)

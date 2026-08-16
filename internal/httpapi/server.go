@@ -25,7 +25,7 @@ type Server struct {
 	catalogs    map[string]dispatch.Catalog
 	dags        map[string]dispatch.TaskDAG
 	controllers map[string]*dispatch.Controller
-	adapter     adapters.Adapter
+	adapters    map[string]adapters.Adapter
 	mutations   []time.Time
 }
 
@@ -37,8 +37,9 @@ func New(mode string, store *core.Store) http.Handler {
 }
 
 func NewAuthenticated(mode string, store *core.Store, token string) http.Handler {
-	s := &Server{Mode: mode, Store: store, Token: token, catalogs: map[string]dispatch.Catalog{}, dags: map[string]dispatch.TaskDAG{}, controllers: map[string]*dispatch.Controller{}, adapter: adapters.NewFixture(adapters.FixturePass)}
+	s := &Server{Mode: mode, Store: store, Token: token, catalogs: map[string]dispatch.Catalog{}, dags: map[string]dispatch.TaskDAG{}, controllers: map[string]*dispatch.Controller{}, adapters: map[string]adapters.Adapter{}}
 	s.loadDefinitions()
+	s.recoverControllers()
 	s.recoverInterrupted()
 	m := http.NewServeMux()
 	m.HandleFunc("GET /healthz", s.health)

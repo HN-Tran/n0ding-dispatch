@@ -24,3 +24,13 @@ func TestRemoteBindFailsClosed(t *testing.T) {
 		t.Fatalf("remote bind=%d", got)
 	}
 }
+
+func TestRunOpenClawFlagsFailClosed(t *testing.T) {
+	base := []string{"run", "--id", "r", "--catalog", "c", "--dag", "d"}
+	if got := run(append(base, "--adapter", "unknown")); got != exitUsage {
+		t.Fatalf("unknown adapter=%d", got)
+	}
+	if got := run(append(base, "--adapter", "openclaw", "--openclaw-endpoint", "http://127.0.0.1:1")); got != exitUsage {
+		t.Fatalf("missing token env=%d", got)
+	}
+}

@@ -17,7 +17,7 @@ func TestPersistentStoreReopensAndContinuesOrderedIDs(t *testing.T) {
 	if err := s.CreateRun(Run{ID: "run-1", Mode: "dispatch", Name: "reopen"}); err != nil {
 		t.Fatal(err)
 	}
-	e1, err := s.Append("run-1", "dispatchmark.started", map[string]any{"case": "one"})
+	e1, err := s.Append("run-1", "dispatch.started", map[string]any{"case": "one"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -37,7 +37,7 @@ func TestPersistentStoreReopensAndContinuesOrderedIDs(t *testing.T) {
 	if p.Status != "running" || p.Steps != 1 || p.LastEventID != e1.ID {
 		t.Fatalf("bad recovered projection: %#v", p)
 	}
-	e2, err := s.Append("run-1", "dispatchmark.completed", map[string]any{"score": 1})
+	e2, err := s.Append("run-1", "dispatch.completed", map[string]any{"score": 1})
 	if err != nil {
 		t.Fatal(err)
 	}

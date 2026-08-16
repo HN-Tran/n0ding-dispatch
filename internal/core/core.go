@@ -273,6 +273,9 @@ func (s *Store) Append(runID, typ string, data map[string]any) (Event, error) {
 }
 
 func nextStatus(current, typ string) string {
+	if !strings.HasPrefix(typ, "dispatch.") {
+		return current
+	}
 	switch {
 	case strings.HasSuffix(typ, ".started"):
 		return "running"
@@ -354,17 +357,17 @@ func (s *Store) Replay(runID string, upto int64) (Projection, error) {
 		p.Steps++
 		p.LastEventID = e.ID
 		switch {
-		case strings.HasSuffix(e.Type, ".started"):
+		case e.Type == "dispatch.started":
 			p.Status = "running"
-		case strings.HasSuffix(e.Type, ".completed"):
+		case e.Type == "dispatch.completed":
 			p.Status = "completed"
-		case strings.HasSuffix(e.Type, ".failed"):
+		case e.Type == "dispatch.failed":
 			p.Status = "failed"
-		case strings.HasSuffix(e.Type, ".cancelled"):
+		case e.Type == "dispatch.cancelled":
 			p.Status = "cancelled"
-		case strings.HasSuffix(e.Type, ".interrupted"):
+		case e.Type == "dispatch.interrupted":
 			p.Status = "interrupted"
-		case strings.HasSuffix(e.Type, ".emergency_stopped"):
+		case e.Type == "dispatch.emergency_stopped":
 			p.Status = "stopped"
 		case e.Type == "artifact.created":
 			if v, ok := e.Data["name"].(string); ok {
