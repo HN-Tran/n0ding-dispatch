@@ -1,18 +1,146 @@
 package httpapi
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/hn-tran/n0ding-dispatch/internal/core"
 	"github.com/hn-tran/n0ding-dispatch/internal/dispatch"
 )
+
+func TestPrivateVerticalLifecycleGate(t *testing.T) {
+	var mu sync.Mutex
+	dispatched := map[string]int{}
+	worker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var in struct {
+			TaskID string `json:"task_id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			http.Error(w, "bad request", 400)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch filepath.Base(r.URL.Path) {
+		case "dispatch":
+			mu.Lock()
+			dispatched[in.TaskID]++
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{"task_id": in.TaskID, "accepted": true})
+		case "result":
+			_ = json.NewEncoder(w).Encode(map[string]any{"task_id": in.TaskID, "state": "completed", "output": map[string]any{"fixture": "http", "task": in.TaskID}})
+		default:
+			_ = json.NewEncoder(w).Encode(map[string]any{"task_id": in.TaskID, "accepted": true})
+		}
+	}))
+	defer worker.Close()
+
+	db := filepath.Join(t.TempDir(), "vertical.db")
+	s, err := core.OpenStore(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := NewConfigured("dispatch", s, "", worker.URL, "fixture-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cat := `{"id":"vertical-cat","catalog":{"Version":"v1","Capabilities":[{"Name":"work","Version":"v1","SideEffecting":false}],"Agents":[{"ID":"worker","Version":"v1","Capabilities":["work@v1"],"Priority":1,"Enabled":true,"MaxConcurrent":1}]}}`
+	dag := `{"id":"vertical-dag","dag":{"Version":"v1","Tasks":[{"ID":"first","Version":"v1","Requires":["work@v1"],"Cost":1},{"ID":"second","Version":"v1","Requires":["work@v1"],"DependsOn":["first"],"Cost":1}],"MaxFanout":1,"Budget":2}}`
+	if w := call(t, h, "POST", "/api/v1/agents", cat); w.Code != 201 {
+		t.Fatal(w.Body.String())
+	}
+	if w := call(t, h, "POST", "/api/v1/tasks", dag); w.Code != 201 {
+		t.Fatal(w.Body.String())
+	}
+	if w := call(t, h, "POST", "/api/v1/dispatch/run", `{"id":"vertical","catalog_id":"vertical-cat","dag_id":"vertical-dag","adapter":"openclaw"}`); w.Code != 201 {
+		t.Fatal(w.Body.String())
+	}
+	mu.Lock()
+	firstDispatches := dispatched["first"]
+	secondBefore := dispatched["second"]
+	mu.Unlock()
+	if firstDispatches != 1 || secondBefore != 0 {
+		t.Fatalf("dependency released early: %+v", dispatched)
+	}
+	if w := call(t, h, "POST", "/api/v1/runs/vertical/controls/reassign", `{"task_id":"first","idempotency_key":"vertical-control","fencing_token":1,"agent":"worker"}`); w.Code != 202 {
+		t.Fatalf("safe control=%d %s", w.Code, w.Body.String())
+	}
+	if w := call(t, h, "POST", "/api/v1/runs/vertical/tasks/first/result", ""); w.Code != 200 {
+		t.Fatalf("first result=%d %s", w.Code, w.Body.String())
+	}
+	mu.Lock()
+	secondReleased := dispatched["second"]
+	mu.Unlock()
+	if secondReleased != 1 {
+		t.Fatalf("dependent task not released: %+v", dispatched)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err = core.OpenStore(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	h, err = NewConfigured("dispatch", s, "", worker.URL, "fixture-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w := call(t, h, "POST", "/api/v1/runs/vertical/tasks/second/result", ""); w.Code != 200 {
+		t.Fatalf("post-restart result=%d %s", w.Code, w.Body.String())
+	}
+	live, err := s.Replay("vertical", 0)
+	if err != nil || live.Status != "completed" {
+		t.Fatalf("live=%+v err=%v", live, err)
+	}
+	export := call(t, h, "GET", "/api/v1/runs/vertical/export", "")
+	if export.Code != 200 {
+		t.Fatal(export.Body.String())
+	}
+	imported := call(t, h, "POST", "/api/v1/replay/import", export.Body.String())
+	if imported.Code != 200 {
+		t.Fatal(imported.Body.String())
+	}
+	var replay struct {
+		Mode       string          `json:"mode"`
+		Projection core.Projection `json:"projection"`
+	}
+	if err := json.Unmarshal(imported.Body.Bytes(), &replay); err != nil || replay.Mode != "replay" {
+		t.Fatalf("replay=%+v err=%v", replay, err)
+	}
+	live.LastEventID, replay.Projection.LastEventID = 0, 0
+	if !bytes.Equal(mustJSON(t, live), mustJSON(t, replay.Projection)) {
+		t.Fatalf("LIVE != REPLAY: live=%+v replay=%+v", live, replay.Projection)
+	}
+
+	seedDefinitions(t, h)
+	if w := call(t, h, "POST", "/api/v1/dispatch/run", `{"id":"vertical-unknown","catalog_id":"cat","dag_id":"dag","adapter":"fixture","fixture_mode":"lost_response"}`); w.Code != 201 {
+		t.Fatal(w.Body.String())
+	}
+	if w := call(t, h, "POST", "/api/v1/runs/vertical-unknown/controls/retry", `{"task_id":"task-1","idempotency_key":"blocked-retry","fencing_token":1}`); w.Code != 409 {
+		t.Fatalf("unknown retry=%d", w.Code)
+	}
+	if w := call(t, h, "POST", "/api/v1/runs/vertical-unknown/reconcile", `{"idempotency_key":"vertical-unknown:task-1:dispatch","result":"verified not applied","evidence":"hermetic fixture transcript","disposition":"not_applied"}`); w.Code != 202 {
+		t.Fatalf("reconcile=%d %s", w.Code, w.Body.String())
+	}
+}
+
+func mustJSON(t *testing.T, value any) []byte {
+	t.Helper()
+	raw, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
 
 func call(t *testing.T, h http.Handler, method, path, body string) *httptest.ResponseRecorder {
 	t.Helper()
