@@ -12,8 +12,9 @@ The distroless image runs as UID/GID `65532` and ships `/data` owned by that
 identity. The default database is `/data/dispatch.db`; Compose mounts its named
 volume at that path.
 
-CI runs `scripts/container-layout-smoke.sh` against both the raw image and a
-compose-like named volume with a read-only root filesystem, `/tmp` tmpfs, and
+CI first runs `scripts/container-layout-smoke.sh` without a `/data` mount to
+prove SQLite works on the raw container writable layer. It then runs a distinct
+compose-like named-volume deployment with a read-only root filesystem, `/tmp` tmpfs, and
 `no-new-privileges`. Each run must stay healthy, execute the authenticated
 deterministic fixture, expose its expected interrupted projection, and create a
 non-empty SQLite database. This is packaging evidence, not a durability or

@@ -21,4 +21,4 @@ jobs:
       - uses: docker/setup-buildx-action@v3
       - uses: docker/build-push-action@v6
         with: {context: ., push: false, load: true, tags: 'n0ding-dispatch:ci'}
-      - run: sh scripts/container-layout-smoke.sh n0ding-dispatch:ci
+      - run: sh -n scripts/container-layout-smoke.sh && sh scripts/container-layout-smoke.sh n0ding-dispatch:ci
