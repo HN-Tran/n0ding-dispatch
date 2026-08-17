@@ -121,10 +121,15 @@ func run(args []string) int {
 		result := fs.String("result", "", "")
 		evidence := fs.String("evidence", "", "")
 		disposition := fs.String("disposition", "", "")
-		if fs.Parse(args[1:]) != nil || *runID == "" || *key == "" || strings.TrimSpace(*result) == "" || strings.TrimSpace(*evidence) == "" || (*disposition != "applied" && *disposition != "not_applied" && *disposition != "still_unknown") {
-			return bad(exitUsage, "reconcile requires --run, --idempotency-key, --result, --evidence and --disposition")
+		task := fs.String("task", "", "")
+		fence := fs.Uint64("fencing-token", 0, "")
+		commandEvent := fs.Int64("command-event-id", 0, "")
+		if fs.Parse(args[1:]) != nil || *runID == "" || *task == "" || *key == "" || *fence == 0 || *commandEvent == 0 || strings.TrimSpace(*result) == "" || strings.TrimSpace(*evidence) == "" || (*disposition != "applied" && *disposition != "not_applied" && *disposition != "still_unknown") {
+			return bad(exitUsage, "reconcile requires run/task/key/fence/command-event/result/evidence/disposition")
 		}
-		return request("POST", fmt.Sprintf("%s/api/v1/runs/%s/reconcile", *base, *runID), *token, map[string]any{"idempotency_key": *key, "result": *result, "evidence": *evidence, "disposition": *disposition}, os.Stdout)
+		ev := httpapi.ReconciliationEvidence{RunID: *runID, TaskID: *task, IdempotencyKey: *key, FencingToken: *fence, CommandEventID: *commandEvent, Disposition: *disposition, Observation: *evidence}
+		ev.Digest = httpapi.ReconciliationEvidenceDigest(ev)
+		return request("POST", fmt.Sprintf("%s/api/v1/runs/%s/reconcile", *base, *runID), *token, map[string]any{"idempotency_key": *key, "result": *result, "evidence": ev, "disposition": *disposition}, os.Stdout)
 	case "export":
 		fs, base, token := remoteFlags("export")
 		runID := fs.String("run", "", "")

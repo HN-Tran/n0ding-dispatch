@@ -19,15 +19,22 @@ import (
 func TestPrivateVerticalLifecycleGate(t *testing.T) {
 	var mu sync.Mutex
 	dispatched := map[string]int{}
+	effects := map[string]int{}
+	totalCalls := 0
 	worker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var in struct {
-			TaskID string `json:"task_id"`
+			TaskID         string `json:"task_id"`
+			IdempotencyKey string `json:"idempotency_key"`
+			FencingToken   uint64 `json:"fencing_token"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 			http.Error(w, "bad request", 400)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
+		mu.Lock()
+		totalCalls++
+		mu.Unlock()
 		switch filepath.Base(r.URL.Path) {
 		case "dispatch":
 			mu.Lock()
@@ -37,6 +44,11 @@ func TestPrivateVerticalLifecycleGate(t *testing.T) {
 		case "result":
 			_ = json.NewEncoder(w).Encode(map[string]any{"task_id": in.TaskID, "state": "completed", "output": map[string]any{"fixture": "http", "task": in.TaskID}})
 		default:
+			mu.Lock()
+			if effects[in.IdempotencyKey] == 0 {
+				effects[in.IdempotencyKey] = 1
+			}
+			mu.Unlock()
 			_ = json.NewEncoder(w).Encode(map[string]any{"task_id": in.TaskID, "accepted": true})
 		}
 	}))
@@ -72,6 +84,29 @@ func TestPrivateVerticalLifecycleGate(t *testing.T) {
 	if w := call(t, h, "POST", "/api/v1/runs/vertical/controls/reassign", `{"task_id":"first","idempotency_key":"vertical-control","fencing_token":1,"agent":"worker"}`); w.Code != 202 {
 		t.Fatalf("safe control=%d %s", w.Code, w.Body.String())
 	}
+	if w := call(t, h, "POST", "/api/v1/runs/vertical/controls/reassign", `{"task_id":"first","idempotency_key":"vertical-control","fencing_token":1,"agent":"worker"}`); w.Code != 200 {
+		t.Fatalf("duplicate control=%d %s", w.Code, w.Body.String())
+	}
+	if w := call(t, h, "POST", "/api/v1/runs/vertical/controls/reassign", `{"task_id":"first","idempotency_key":"stale-control","fencing_token":1,"agent":"worker"}`); w.Code != 409 {
+		t.Fatalf("stale fence=%d %s", w.Code, w.Body.String())
+	}
+	mu.Lock()
+	controlEffects := effects["vertical-control"]
+	mu.Unlock()
+	if controlEffects != 1 {
+		t.Fatalf("external control effects=%d", controlEffects)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err = core.OpenStore(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err = NewConfigured("dispatch", s, "", worker.URL, "fixture-token")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if w := call(t, h, "POST", "/api/v1/runs/vertical/tasks/first/result", ""); w.Code != 200 {
 		t.Fatalf("first result=%d %s", w.Code, w.Body.String())
 	}
@@ -101,6 +136,9 @@ func TestPrivateVerticalLifecycleGate(t *testing.T) {
 	if err != nil || live.Status != "completed" {
 		t.Fatalf("live=%+v err=%v", live, err)
 	}
+	mu.Lock()
+	beforeReplayCalls := totalCalls
+	mu.Unlock()
 	export := call(t, h, "GET", "/api/v1/runs/vertical/export", "")
 	if export.Code != 200 {
 		t.Fatal(export.Body.String())
@@ -116,19 +154,57 @@ func TestPrivateVerticalLifecycleGate(t *testing.T) {
 	if err := json.Unmarshal(imported.Body.Bytes(), &replay); err != nil || replay.Mode != "replay" {
 		t.Fatalf("replay=%+v err=%v", replay, err)
 	}
+	mu.Lock()
+	afterReplayCalls := totalCalls
+	mu.Unlock()
+	if afterReplayCalls != beforeReplayCalls {
+		t.Fatalf("export/import invoked worker: before=%d after=%d", beforeReplayCalls, afterReplayCalls)
+	}
+	events := s.Events("vertical", 0)
+	if live.LastEventID != events[len(events)-1].ID || replay.Projection.LastEventID != int64(len(events)) || live.Steps != replay.Projection.Steps {
+		t.Fatalf("cursor/sequence mismatch live=%+v replay=%+v events=%d", live, replay.Projection, len(events))
+	}
 	live.LastEventID, replay.Projection.LastEventID = 0, 0
 	if !bytes.Equal(mustJSON(t, live), mustJSON(t, replay.Projection)) {
 		t.Fatalf("LIVE != REPLAY: live=%+v replay=%+v", live, replay.Projection)
 	}
 
+	lostWorker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var in map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&in)
+		if filepath.Base(r.URL.Path) == "dispatch" {
+			if hijacker, ok := w.(http.Hijacker); ok {
+				conn, _, _ := hijacker.Hijack()
+				_ = conn.Close()
+				return
+			}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"task_id": in["task_id"], "state": "completed"})
+	}))
+	defer lostWorker.Close()
+	h, err = NewConfigured("dispatch", s, "", lostWorker.URL, "fixture-token")
+	if err != nil {
+		t.Fatal(err)
+	}
 	seedDefinitions(t, h)
-	if w := call(t, h, "POST", "/api/v1/dispatch/run", `{"id":"vertical-unknown","catalog_id":"cat","dag_id":"dag","adapter":"fixture","fixture_mode":"lost_response"}`); w.Code != 201 {
+	if w := call(t, h, "POST", "/api/v1/dispatch/run", `{"id":"vertical-unknown","catalog_id":"cat","dag_id":"dag","adapter":"openclaw"}`); w.Code != 201 {
 		t.Fatal(w.Body.String())
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err = core.OpenStore(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err = NewConfigured("dispatch", s, "", lostWorker.URL, "fixture-token")
+	if err != nil {
+		t.Fatal(err)
 	}
 	if w := call(t, h, "POST", "/api/v1/runs/vertical-unknown/controls/retry", `{"task_id":"task-1","idempotency_key":"blocked-retry","fencing_token":1}`); w.Code != 409 {
 		t.Fatalf("unknown retry=%d", w.Code)
 	}
-	if w := call(t, h, "POST", "/api/v1/runs/vertical-unknown/reconcile", `{"idempotency_key":"vertical-unknown:task-1:dispatch","result":"verified not applied","evidence":"hermetic fixture transcript","disposition":"not_applied"}`); w.Code != 202 {
+	if w := call(t, h, "POST", "/api/v1/runs/vertical-unknown/reconcile", reconciliationBody(t, s, "vertical-unknown", "vertical-unknown:task-1:dispatch", "not_applied", "hermetic fixture transcript")); w.Code != 202 {
 		t.Fatalf("reconcile=%d %s", w.Code, w.Body.String())
 	}
 }
@@ -151,6 +227,25 @@ func call(t *testing.T, h http.Handler, method, path, body string) *httptest.Res
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, r)
 	return w
+}
+
+func reconciliationBody(t *testing.T, store *core.Store, runID, key, disposition, observation string) string {
+	t.Helper()
+	var evidence ReconciliationEvidence
+	for _, event := range store.Events(runID, 0) {
+		if event.Type == "command.outcome_unknown" && stringValue(event.Data["idempotency_key"]) == key {
+			evidence = ReconciliationEvidence{RunID: runID, TaskID: stringValue(event.Data["task_id"]), IdempotencyKey: key, FencingToken: uint64Number(event.Data["fence"]), CommandEventID: event.ID, Disposition: disposition, Observation: observation}
+		}
+	}
+	if evidence.CommandEventID == 0 {
+		t.Fatalf("unknown command event absent for %s", key)
+	}
+	evidence.Digest = ReconciliationEvidenceDigest(evidence)
+	raw, err := json.Marshal(map[string]any{"idempotency_key": key, "result": observation, "disposition": disposition, "evidence": evidence})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(raw)
 }
 func seedDefinitions(t *testing.T, h http.Handler) (string, string) {
 	t.Helper()
@@ -500,7 +595,34 @@ func TestLostResponseRequiresReconciliation(t *testing.T) {
 	if w.Code != http.StatusConflict {
 		t.Fatalf("unresolved retry=%d %s", w.Code, w.Body.String())
 	}
-	w = call(t, h, "POST", "/api/v1/runs/unknown/reconcile", `{"idempotency_key":"unknown:task-1:dispatch","result":"observed-not-applied","evidence":"operator checked upstream request log entry 42","disposition":"not_applied"}`)
+	validEvidence := reconciliationBody(t, s, "unknown", "unknown:task-1:dispatch", "not_applied", "operator checked upstream request log entry 42")
+	for name, mutate := range map[string]func(map[string]any){
+		"fabricated-digest": func(e map[string]any) { e["digest"] = strings.Repeat("0", 64) },
+		"wrong-task":        func(e map[string]any) { e["task_id"] = "other" },
+		"wrong-run":         func(e map[string]any) { e["run_id"] = "other" },
+		"wrong-fence":       func(e map[string]any) { e["fence"] = float64(99) },
+		"stale-event":       func(e map[string]any) { e["command_event_id"] = float64(1) },
+	} {
+		var body map[string]any
+		if err := json.Unmarshal([]byte(validEvidence), &body); err != nil {
+			t.Fatal(err)
+		}
+		evidenceMap := body["evidence"].(map[string]any)
+		mutate(evidenceMap)
+		if name != "fabricated-digest" {
+			evidenceRaw, _ := json.Marshal(evidenceMap)
+			var rebound ReconciliationEvidence
+			if err := json.Unmarshal(evidenceRaw, &rebound); err != nil {
+				t.Fatal(err)
+			}
+			evidenceMap["digest"] = ReconciliationEvidenceDigest(rebound)
+		}
+		raw, _ := json.Marshal(body)
+		if rejected := call(t, h, "POST", "/api/v1/runs/unknown/reconcile", string(raw)); rejected.Code != 403 {
+			t.Fatalf("%s evidence accepted: %d %s", name, rejected.Code, rejected.Body.String())
+		}
+	}
+	w = call(t, h, "POST", "/api/v1/runs/unknown/reconcile", validEvidence)
 	if w.Code != 202 {
 		t.Fatalf("reconcile: %d %s", w.Code, w.Body.String())
 	}
@@ -516,7 +638,7 @@ func TestAppliedReconciliationCompletesObservedTask(t *testing.T) {
 	h := New("dispatch", s)
 	seedDefinitions(t, h)
 	_ = call(t, h, "POST", "/api/v1/dispatch/run", `{"id":"applied","catalog_id":"cat","dag_id":"dag","fixture_mode":"lost_response"}`)
-	w := call(t, h, "POST", "/api/v1/runs/applied/reconcile", `{"idempotency_key":"applied:task-1:dispatch","result":"verified upstream result","evidence":"runtime audit 42","disposition":"applied"}`)
+	w := call(t, h, "POST", "/api/v1/runs/applied/reconcile", reconciliationBody(t, s, "applied", "applied:task-1:dispatch", "applied", "runtime audit 42"))
 	if w.Code != 202 {
 		t.Fatalf("reconcile=%d %s", w.Code, w.Body.String())
 	}
@@ -532,7 +654,7 @@ func TestStillUnknownReconciliationRemainsFailClosed(t *testing.T) {
 	h := New("dispatch", s)
 	seedDefinitions(t, h)
 	_ = call(t, h, "POST", "/api/v1/dispatch/run", `{"id":"still","catalog_id":"cat","dag_id":"dag","fixture_mode":"lost_response"}`)
-	w := call(t, h, "POST", "/api/v1/runs/still/reconcile", `{"idempotency_key":"still:task-1:dispatch","result":"inconclusive","evidence":"runtime audit incomplete","disposition":"still_unknown"}`)
+	w := call(t, h, "POST", "/api/v1/runs/still/reconcile", reconciliationBody(t, s, "still", "still:task-1:dispatch", "still_unknown", "runtime audit incomplete"))
 	if w.Code != 202 || !strings.Contains(w.Body.String(), `"reconciled":false`) {
 		t.Fatalf("reconcile=%d %s", w.Code, w.Body.String())
 	}

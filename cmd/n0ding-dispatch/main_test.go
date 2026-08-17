@@ -50,7 +50,7 @@ func TestControlAndReconcileSendSafetyFields(t *testing.T) {
 		t.Fatalf("control request=%+v", control)
 	}
 
-	base := []string{"reconcile", "--server", server.URL, "--run", "r", "--idempotency-key", "k", "--result", "observed"}
+	base := []string{"reconcile", "--server", server.URL, "--run", "r", "--task", "t", "--idempotency-key", "k", "--fencing-token", "7", "--command-event-id", "42", "--result", "observed"}
 	if got := run(base); got != exitUsage {
 		t.Fatalf("missing evidence=%d", got)
 	}
@@ -58,7 +58,8 @@ func TestControlAndReconcileSendSafetyFields(t *testing.T) {
 		t.Fatalf("reconcile=%d", got)
 	}
 	reconcile := <-requests
-	if reconcile.path != "/api/v1/runs/r/reconcile" || reconcile.body["evidence"] != "operator-check-42" || reconcile.body["disposition"] != "not_applied" {
+	evidence, _ := reconcile.body["evidence"].(map[string]any)
+	if reconcile.path != "/api/v1/runs/r/reconcile" || evidence["observation"] != "operator-check-42" || evidence["run_id"] != "r" || evidence["task_id"] != "t" || evidence["fence"] != float64(7) || evidence["command_event_id"] != float64(42) || evidence["digest"] == "" || reconcile.body["disposition"] != "not_applied" {
 		t.Fatalf("reconcile request=%+v", reconcile)
 	}
 }

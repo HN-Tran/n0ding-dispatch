@@ -35,7 +35,7 @@ n0ding-dispatch control --run RUN --task TASK --fencing-token TOKEN --agent AGEN
 n0ding-dispatch control --run RUN emergency-stop
 n0ding-dispatch approve --run RUN --digest DIGEST --decision grant|deny
 n0ding-dispatch check-result --run RUN --task TASK
-n0ding-dispatch reconcile --run RUN --idempotency-key KEY --result RESULT --evidence EVIDENCE --disposition applied|not_applied|still_unknown
+n0ding-dispatch reconcile --run RUN --task TASK --idempotency-key KEY --fencing-token FENCE --command-event-id EVENT --result RESULT --evidence OBSERVATION --disposition applied|not_applied|still_unknown
 n0ding-dispatch export --run RUN
 n0ding-dispatch doctor
 ```

@@ -66,7 +66,10 @@ func (s *Server) recoverControllers() {
 			commandID, _ := event.Data["command_id"].(string)
 			taskID, _ := event.Data["task_id"].(string)
 			state, _ := event.Data["state"].(string)
-			fence := uint64Number(event.Data["fencing_token"])
+			fence := uint64Number(event.Data["fence"])
+			if fence == 0 {
+				fence = uint64Number(event.Data["fencing_token"])
+			}
 			if key == "" || commandID == "" || taskID == "" || state == "" {
 				continue
 			}
@@ -455,7 +458,7 @@ func topological(tasks []dispatch.Task) ([]dispatch.Task, error) {
 	return out, nil
 }
 func commandData(c dispatch.Command, action string) map[string]any {
-	return map[string]any{"command_id": c.ID, "idempotency_key": c.IdempotencyKey, "task_id": c.TaskID, "state": c.State, "fencing_token": c.Fence, "action": action, "result": c.Result, "error": c.Error}
+	return map[string]any{"command_id": c.ID, "idempotency_key": c.IdempotencyKey, "task_id": c.TaskID, "state": c.State, "fence": c.Fence, "action": action, "result": c.Result, "error": c.Error}
 }
 
 func (s *Server) control(w http.ResponseWriter, r *http.Request) {
@@ -978,13 +981,13 @@ func (s *Server) reconcile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var in struct {
-		IdempotencyKey string `json:"idempotency_key"`
-		Result         string `json:"result"`
-		Evidence       string `json:"evidence"`
-		Disposition    string `json:"disposition"`
+		IdempotencyKey string                 `json:"idempotency_key"`
+		Result         string                 `json:"result"`
+		Disposition    string                 `json:"disposition"`
+		Evidence       ReconciliationEvidence `json:"evidence"`
 	}
-	if err := decodeBounded(w, r, &in); err != nil || in.IdempotencyKey == "" || strings.TrimSpace(in.Result) == "" || strings.TrimSpace(in.Evidence) == "" || (in.Disposition != "applied" && in.Disposition != "not_applied" && in.Disposition != "still_unknown") {
-		write(w, 400, map[string]string{"error": "idempotency_key, result, evidence and disposition (applied|not_applied|still_unknown) required"})
+	if err := decodeBounded(w, r, &in); err != nil || in.IdempotencyKey == "" || strings.TrimSpace(in.Result) == "" || (in.Disposition != "applied" && in.Disposition != "not_applied" && in.Disposition != "still_unknown") {
+		write(w, 400, map[string]string{"error": "idempotency_key, result, typed evidence and disposition required"})
 		return
 	}
 	s.mu.Lock()
@@ -997,6 +1000,16 @@ func (s *Server) reconcile(w http.ResponseWriter, r *http.Request) {
 	cmd, ok := ctrl.Command(in.IdempotencyKey)
 	if !ok || cmd.State != dispatch.CommandOutcomeUnknown {
 		write(w, 409, map[string]string{"error": "command is not awaiting reconciliation"})
+		return
+	}
+	var unknownEventID int64
+	for _, event := range s.Store.Events(id, 0) {
+		if event.Type == "command.outcome_unknown" && stringValue(event.Data["idempotency_key"]) == in.IdempotencyKey {
+			unknownEventID = event.ID
+		}
+	}
+	if in.Evidence.RunID != id || in.Evidence.TaskID != cmd.TaskID || in.Evidence.IdempotencyKey != in.IdempotencyKey || in.Evidence.FencingToken != cmd.Fence || in.Evidence.CommandEventID != unknownEventID || in.Evidence.Disposition != in.Disposition || strings.TrimSpace(in.Evidence.Observation) == "" || in.Evidence.Digest != ReconciliationEvidenceDigest(in.Evidence) {
+		write(w, 403, map[string]string{"error": "reconciliation evidence is unverified or mismatched"})
 		return
 	}
 	req, err := s.appendCritical(id, "reconciliation.requested", map[string]any{"idempotency_key": in.IdempotencyKey, "command_id": cmd.ID, "evidence": in.Evidence, "disposition": in.Disposition})
@@ -1058,6 +1071,24 @@ func (s *Server) reconcile(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	write(w, 202, map[string]any{"reconciled": true, "command": cmd})
+}
+
+type ReconciliationEvidence struct {
+	RunID          string `json:"run_id"`
+	TaskID         string `json:"task_id"`
+	IdempotencyKey string `json:"idempotency_key"`
+	FencingToken   uint64 `json:"fence"`
+	CommandEventID int64  `json:"command_event_id"`
+	Disposition    string `json:"disposition"`
+	Observation    string `json:"observation"`
+	Digest         string `json:"digest"`
+}
+
+func ReconciliationEvidenceDigest(e ReconciliationEvidence) string {
+	e.Digest = ""
+	raw, _ := json.Marshal(e)
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
 }
 
 func (s *Server) allTasksCompleted(id string) bool {
