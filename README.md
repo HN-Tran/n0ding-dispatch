@@ -1,8 +1,14 @@
 # n0ding Dispatch
 
+[![CI](https://github.com/HN-Tran/n0ding-dispatch/actions/workflows/ci.yml/badge.svg)](https://github.com/HN-Tran/n0ding-dispatch/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+![Status](https://img.shields.io/badge/status-public%20preview-orange)
+
 Local-first observability and control center for routing work to external agent runtimes with durable evidence and safe operator intervention.
 
-> Private v0.1 development branch. Not published, stable, or production-ready.
+> **Public v0.1 preview.** The interfaces may change and the project is not
+> production-ready. Keep runtime credentials server-side and use it only in a
+> reviewed environment.
 
 ```bash
 go build -o n0ding-dispatch ./cmd/n0ding-dispatch
@@ -46,6 +52,10 @@ CLI to poll a selected task. A persisted `task.completed` result releases its
 dependants; failed or cancelled results terminate safely. Repeat result checks
 while the runtime reports a non-terminal state.
 
-Private v0.1 focuses on deterministic routing, a real OpenClaw adapter, a reproducible HTTP fixture adapter, persistent commands and leases, digest-bound approvals, honest `outcome_unknown` handling, restart recovery, read-only replay, and a task-first LIVE/REPLAY control center. It does not claim intelligent routing, exactly-once side effects, multi-node HA, or production readiness.
+The v0.1 public preview focuses on deterministic routing, a real OpenClaw adapter, a reproducible HTTP fixture adapter, persistent commands and leases, digest-bound approvals, honest `outcome_unknown` handling, restart recovery, read-only replay, and a task-first LIVE/REPLAY control center. It does not claim intelligent routing, exactly-once side effects, multi-node HA, or production readiness.
 
-Documentation: [domain contracts](docs/domain-contracts.md), [state machine](docs/dispatch-state-machine.md), [HTTP API](docs/api.md), [operations](docs/operations.md), [security](docs/security.md), [threat model](docs/threat-model.md), and the [private release gate](docs/release-gate.md).
+Documentation: [domain contracts](docs/domain-contracts.md), [state machine](docs/dispatch-state-machine.md), [HTTP API](docs/api.md), [operations](docs/operations.md), [security](docs/security.md), [threat model](docs/threat-model.md), and the [preview release gate](docs/release-gate.md).
+
+Focused contributions are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md).
+Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
+n0ding Dispatch is licensed under [Apache-2.0](LICENSE).
